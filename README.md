@@ -17,7 +17,7 @@
     5. 一个 GUI 管理器，集配置、监控、修复于一体
 
 [R0DUMP 刷机包](https://r0dump.ivory.cafe/lineage-23.2-r0dump16-RELEASE-lemonade-releasekeys-mtless-20260711_184823.zip)
-[R0DUMP 定制 GAPPS 注入包](https://r0dump.ivory.cafe/r0dump_gapps_injected_images.zip)
+[R0DUMP 定制 GAPPS 刷机包](https://r0dump.ivory.cafe/r0dump_gapps_injected_images.zip)
 
 ## R0DUMP 如何使用？
 
@@ -29,8 +29,7 @@
 
 ### 刷机
 
-1. 参考[教程](docs/R0DUMP%20刷机教程.md)刷入 R0DUMP 系统
-2. (如果需要 Google 生态) 刷完 1 后不要进入系统，立即根据[教程](docs/R0DUMP%20刷机教程.md)刷入 GAPP 定制注入包
+参考[教程](docs/R0DUMP%20刷机教程.md)刷入 R0DUMP 系统
 
 ### DUMP
 
