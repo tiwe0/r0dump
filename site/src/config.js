@@ -1,5 +1,5 @@
 // Central config — production URLs for the r0dump-fusion site.
-const R2 = 'https://dl.r0dump.com/v2026-09-12'
+const R2 = 'https://dl.r0dump.com/v2026-11-07'
 
 export const CONFIG = {
   github: 'https://github.com/tiwe0/r0dump',
