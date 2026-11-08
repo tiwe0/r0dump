@@ -1,0 +1,964 @@
+diff --git a/aidegen/aidegen_completion.sh b/aidegen/aidegen_completion.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..e57d86eff8aaee4196c7efae8a521c9941e0e77d
+--- /dev/null
++++ b/aidegen/aidegen_completion.sh
+@@ -0,0 +1,958 @@
++//
++// Copyright (C) 2022-2026 The LineageOS Project
++//
++// SPDX-License-Identifier: Apache-2.0
++//
++
++cc_library_shared {
++    name: "android.hardware.gnss@1.0_types",
++    srcs: ["interfaces/gnss/1.0/types.cpp"],
++    shared_libs: ["android.hardware.gnss@1.0"],
++    system_ext_specific: true,
++    vendor_available: true,
++}
++
++cc_library_shared {
++    name: "android.hardware.graphics.common@1.0_types",
++    srcs: ["interfaces/graphics/common/1.0/types.cpp"],
++    shared_libs: ["android.hardware.graphics.common@1.0"],
++    system_ext_specific: true,
++    vendor_available: true,
++}
++
++cc_library_shared {
++    name: "android.hardware.radio@1.0_types",
++    srcs: ["interfaces/radio/1.0/types.cpp"],
++    shared_libs: ["android.hardware.radio@1.0"],
++    system_ext_specific: true,
++    vendor_available: true,
++}
++
++cc_library_shared {
++    name: "android.hardware.sensors@1.0-convert-shared",
++    shared_libs: ["libhidlbase"],
++    whole_static_libs: ["android.hardware.sensors@1.0-convert"],
++    vendor_available: true,
++}
++
++cc_library_shared {
++    name: "android.hidl.base@1.0",
++    shared_libs: ["libhidlbase"],
++    system_ext_specific: true,
++    vendor_available: true,
++}
++
++cc_library_shared {
++    name: "android.hidl.manager@1.0",
++    shared_libs: ["libhidlbase"],
++    system_ext_specific: true,
++    vendor_available: true,
++}
++
++cc_library_shared {
++    name: "libaudioproxy_shim",
++    srcs: ["libaudioproxy/libaudioproxy_shim.cpp"],
++    proprietary: true,
++}
++
++cc_library_shared {
++    name: "libaudioutils_shim",
++    shared_libs: [
++        "libaudioutils",
++    ],
++    srcs: [
++        "libaudioutils/mutex.cpp",
++    ],
++    vendor: true,
++}
++
++cc_library_shared {
++    name: "libavservices_minijail_vendor",
++    shared_libs: ["libavservices_minijail"],
++    vendor: true,
++}
++
++cc_library_shared {
++    name: "libbluetooth_audio_session_aidl_shim",
++    shared_libs: [
++        "libbluetooth_audio_session_aidl",
++    ],
++    srcs: [
++        "libbluetooth_audio_session_aidl/BluetoothAudioSession.cpp",
++    ],
++    vendor: true,
++}
++
++cc_defaults {
++    name: "libgui_shim_defaults",
++    shared_libs: ["libutils"],
++    srcs: [
++        "libgui/GraphicBufferProducer.cpp",
++        "libgui/SurfaceComposerClient.cpp",
++    ],
++}
++
++cc_library_shared {
++    name: "libaudioclient_shim",
++    shared_libs: [
++        "libaudioclient",
++        "liblog",
++        "libutils",
++    ],
++    header_libs: ["libmedia_headers"],
++    srcs: ["libaudioclient/AudioTrack.cpp"],
++}
++
++cc_prebuilt_library_shared {
++    name: "libaudioroute-v34",
++    vendor: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "libc++",
++        "libcutils",
++        "libexpat",
++        "liblog",
++        "libtinyalsa",
++        "libutils",
++    ],
++    target: {
++        android_arm: {
++            srcs: ["vndk/v34/arm/libaudioroute-v34.so"],
++        },
++        android_arm64: {
++            srcs: ["vndk/v34/arm64/libaudioroute-v34.so"],
++        },
++    },
++    compile_multilib: "both",
++}
++
++cc_library {
++    name: "libbase_shim",
++    shared_libs: ["libbase"],
++    srcs: [
++        "libbase/file.cpp",
++        "libbase/logging.cpp",
++        "libbase/strings.cpp",
++    ],
++    vendor: true,
++}
++
++cc_prebuilt_library_shared {
++    name: "libbase-v33",
++    vendor: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "libc++",
++        "liblog",
++    ],
++    target: {
++        android_arm: {
++            srcs: ["vndk/v33/arm/libbase-v33.so"],
++        },
++        android_arm64: {
++            srcs: ["vndk/v33/arm64/libbase-v33.so"],
++        },
++    },
++    compile_multilib: "both",
++}
++
++cc_library {
++    name: "libbinder_shim",
++    shared_libs: [
++        "libbinder",
++        "libutils",
++    ],
++    header_libs: ["libbinder_headers"],
++    srcs: [
++        "libbinder/IServiceManager.cpp",
++        "libbinder/OS_android.cpp",
++        "libbinder/PermissionCache.cpp",
++    ],
++    version_script: "libbinder/libbinder.map",
++    vendor_available: true,
++}
++
++cc_library {
++    name: "libc_mutexdestroy_shim",
++    shared_libs: ["libc"],
++    srcs: ["libc/pthread_mutex_destroy.cpp"],
++    sanitize: {
++        never: true,
++    },
++    stl: "none",
++    vendor: true,
++}
++
++cc_library {
++    name: "libc_pthreadts_shim",
++    shared_libs: ["libc"],
++    srcs: ["libc/pthread_cond_timedwait.cpp"],
++    vendor: true,
++}
++
++cc_library {
++    name: "libcamera_metadata_shim",
++    shared_libs: ["libcamera_metadata"],
++    srcs: ["libcamera_metadata/camera_metadata.cpp"],
++    vendor: true,
++}
++
++cc_library_shared {
++    name: "libcamera_provider_shim",
++    shared_libs: [
++        "camera.device@1.0-impl",
++        "camera.device@3.2-impl",
++        "camera.device@3.3-impl",
++        "camera.device@3.4-impl",
++        "camera.device@3.5-impl",
++        "libcamera_metadata",
++    ],
++    include_dirs: [
++        "hardware/interfaces/camera/common/default/include/",
++        "hardware/libhardware/include",
++    ],
++    srcs: ["libcamera_provider/camera_provider.cpp"],
++    vendor: true,
++}
++
++cc_library_shared {
++    name: "libcodec2_shim",
++    shared_libs: [
++        "libcodec2_vndk",
++    ],
++    srcs: [
++        "libcodec2/C2Fence.cpp",
++    ],
++    vendor: true,
++}
++
++cc_prebuilt_library_shared {
++    name: "libcrypto-v33",
++    vendor: true,
++    strip: {
++        none: true,
++    },
++    target: {
++        android_arm: {
++            srcs: ["vndk/v33/arm/libcrypto-v33.so"],
++        },
++        android_arm64: {
++            srcs: ["vndk/v33/arm64/libcrypto-v33.so"],
++        },
++    },
++    compile_multilib: "both",
++}
++
++cc_library {
++    name: "libcrypto_shim",
++    srcs: [
++        "libcrypto/cbs.c",
++    ],
++    system_ext_specific: true,
++    vendor_available: true,
++}
++
++cc_prebuilt_library_shared {
++    name: "libcutils-v29",
++    system_ext_specific: true,
++    vendor_available: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "libbase",
++        "libc++",
++        "liblog",
++    ],
++    target: {
++        android_arm: {
++            srcs: ["vndk/v29/arm/libcutils-v29.so"],
++        },
++        android_arm64: {
++            srcs: ["vndk/v29/arm64/libcutils-v29.so"],
++        },
++    },
++    compile_multilib: "both",
++}
++
++cc_library {
++    name: "libcutils_shim",
++    shared_libs: [
++        "libcutils",
++    ],
++    srcs: [
++        "libcutils/strdup16to8.cpp",
++        "libcutils/strdup8to16.cpp",
++    ],
++    vendor_available: true,
++}
++
++cc_library {
++    name: "libdemangle",
++    vendor_available: true,
++    whole_static_libs: [
++        "libc++demangle",
++    ],
++}
++
++cc_library {
++    name: "libgui_shim",
++    defaults: ["libgui_shim_defaults"],
++    shared_libs: ["libgui"],
++    system_ext_specific: true,
++}
++
++cc_library {
++    name: "libgui_shim_vendor",
++    defaults: ["libgui_shim_defaults"],
++    shared_libs: ["libgui_vendor"],
++    vendor: true,
++}
++
++cc_prebuilt_library_shared {
++    name: "libhidlbase-v32",
++    system_ext_specific: true,
++    recovery_available: true,
++    vendor_available: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "libbase",
++        "libc++",
++        "libcutils",
++        "liblog",
++        "libutils",
++        //"libvndksupport", not recovery_available
++    ],
++    target: {
++        android_arm: {
++            srcs: ["vndk/v32/arm/libhidlbase-v32.so"],
++        },
++        android_arm64: {
++            srcs: ["vndk/v32/arm64/libhidlbase-v32.so"],
++        },
++    },
++    compile_multilib: "both",
++    check_elf_files: false, // TODO remove after libvndksupport issue is fixed
++}
++
++cc_library {
++    name: "libhidlbase_shim",
++    srcs: [
++        "libhidlbase/gBnsConstructorMap.cpp",
++        "libhidlbase/Parcel.cpp",
++    ],
++    shared_libs: ["libhidlbase"],
++    compile_multilib: "both",
++    vendor: true,
++}
++
++cc_library {
++    name: "libinput_shim",
++    srcs: [
++        "libinput/android_view_KeyEvent.cpp",
++        "libinput/Input.cpp",
++    ],
++    include_dirs: [
++        "frameworks/native/include",
++        "frameworks/native/libs/ui/include",
++    ],
++    shared_libs: [
++        "libandroid_runtime",
++        "libinput",
++    ],
++    compile_multilib: "64",
++    system_ext_specific: true,
++}
++
++cc_library {
++    name: "libjsoncpp_shim",
++    srcs: [
++        "libjsoncpp/json_value.cpp",
++    ],
++    shared_libs: ["libjsoncpp"],
++    compile_multilib: "both",
++    vendor: true,
++}
++
++cc_defaults {
++    name: "libMegviiFacepp_defaults",
++    vendor: true,
++    srcs: [
++        "megvii/megvii.c",
++    ],
++}
++
++cc_library_shared {
++    name: "libMegviiFacepp-0.5.2",
++    defaults: ["libMegviiFacepp_defaults"],
++}
++
++cc_library_shared {
++    name: "libMegviiBeautyBody",
++    defaults: ["libMegviiFacepp_defaults"],
++    vendor: true,
++}
++
++cc_library_shared {
++    name: "libmegface",
++    defaults: ["libMegviiFacepp_defaults"],
++    vendor: true,
++}
++
++cc_library_shared {
++    name: "libmegskeleton",
++    vendor: true,
++}
++
++cc_library {
++    name: "libmeminfo_shim",
++    shared_libs: ["libmeminfo"],
++    srcs: [
++        "libmeminfo/procmeminfo.cpp",
++    ],
++    vendor: true,
++}
++
++cc_library {
++    name: "libmemset_shim",
++    target: {
++        android_arm: {
++            srcs: ["libmemset/memset32.S"],
++            sanitize: {
++                misc_undefined: ["integer"],
++            },
++        },
++        android_arm64: {
++            srcs: ["libmemset/android_memset.S"],
++            sanitize: {
++                misc_undefined: ["integer"],
++            },
++        },
++    },
++    vendor: true,
++}
++
++cc_library_shared {
++    name: "libpiex_shim",
++    shared_libs: ["libpiex"],
++    srcs: ["libpiex/piex_shim.cpp"],
++    vendor: true,
++}
++
++cc_library_shared {
++    name: "libui_shim",
++    shared_libs: [
++        "libsync",
++        "libui",
++        "libutils",
++    ],
++    srcs: [
++        "libui/Fence.cpp",
++        "libui/GraphicBuffer.cpp",
++        "libui/GraphicBufferMapper.cpp",
++    ],
++    system_ext_specific: true,
++    vendor_available: true,
++}
++
++cc_prebuilt_library_shared {
++    name: "libui-v34",
++    vendor: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "android.hardware.graphics.common-V7-ndk",
++        "android.hardware.graphics.allocator-V2-ndk",
++        "android.hardware.graphics.allocator@2.0",
++        "android.hardware.graphics.allocator@3.0",
++        "android.hardware.graphics.allocator@4.0",
++        "android.hardware.graphics.common@1.2",
++        "android.hardware.graphics.mapper@2.0",
++        "android.hardware.graphics.mapper@2.1",
++        "android.hardware.graphics.mapper@3.0",
++        "android.hardware.graphics.mapper@4.0",
++        "libbase",
++        "libbinder_ndk",
++        "libcutils",
++        "libgralloctypes",
++        "libhidlbase",
++        "libsync",
++        "libutils",
++        "liblog",
++        "libvndksupport",
++        "libc++",
++        "libc",
++        "libm",
++        "libdl",
++    ],
++    target: {
++        android_arm: {
++            srcs: ["vndk/v34/arm/libui-v34.so"],
++        },
++        android_arm64: {
++            srcs: ["vndk/v34/arm64/libui-v34.so"],
++        },
++    },
++    compile_multilib: "both",
++}
++
++cc_prebuilt_library_shared {
++    name: "libutils-v32",
++    vendor: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "libc++",
++        "libcutils",
++        "liblog",
++        "libprocessgroup",
++        "libprocessgroup_shim",
++        "libvndksupport",
++    ],
++    target: {
++        android_arm: {
++            srcs: ["vndk/v32/arm/libutils-v32.so"],
++        },
++        android_arm64: {
++            srcs: ["vndk/v32/arm64/libutils-v32.so"],
++        },
++    },
++    compile_multilib: "both",
++}
++
++cc_prebuilt_library_shared {
++    name: "libutils-v33",
++    vendor: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "libc++",
++        "libcutils",
++        "liblog",
++        "libvndksupport",
++    ],
++    target: {
++        android_arm: {
++            srcs: ["vndk/v33/arm/libutils-v33.so"],
++        },
++        android_arm64: {
++            srcs: ["vndk/v33/arm64/libutils-v33.so"],
++        },
++    },
++    compile_multilib: "both",
++}
++
++cc_library_shared {
++    name: "libutils_shim",
++    shared_libs: ["libutils"],
++    srcs: ["libutils/String16.cpp"],
++    system_ext_specific: true,
++    vendor_available: true,
++}
++
++cc_library_shared {
++    name: "libwfdservice_shim",
++    shared_libs: [
++        "android.media.audio.common.types-V4-cpp",
++        "audioclient-types-aidl-cpp",
++        "libaudioclient",
++        "libaudiofoundation",
++        "libutils",
++    ],
++    srcs: ["libwfdservice/libwfdservice_shim.cpp"],
++    system_ext_specific: true,
++}
++
++cc_library {
++    name: "libip_checksum_shim",
++    whole_static_libs: [
++        "libip_checksum",
++    ],
++    vendor_available: true,
++}
++
++cc_library {
++    name: "libnativehelper_shim",
++    version_script: "libnativehelper/libnativehelper.map",
++    srcs: [
++        "libnativehelper/libnativehelper.cpp",
++    ],
++}
++
++cc_library_shared {
++    name: "libprocessgroup_shim",
++    srcs: [
++        "libprocessgroup/processgroup.cpp",
++    ],
++    shared_libs: [
++        "libprocessgroup",
++    ],
++    vendor: true,
++}
++
++cc_library_shared {
++    name: "libsensor_vendor",
++    srcs: [
++        "libsensor/Sensor.cpp",
++        "libsensor/SensorEventQueue.cpp",
++        "libsensor/SensorManager.cpp",
++    ],
++    shared_libs: [
++        "libsensorndkbridge",
++        "libutils",
++    ],
++    vendor: true,
++}
++
++cc_library_shared {
++    name: "libtinyxml2_shim",
++    srcs: ["libtinyxml2/XMLDocument.cpp"],
++    shared_libs: ["libtinyxml2"],
++    system_ext_specific: true,
++    vendor_available: true,
++}
++
++cc_prebuilt_library_shared {
++    name: "libtinyxml2-v34",
++    vendor: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "liblog",
++        "libc++",
++        "libc",
++        "libm",
++        "libdl",
++    ],
++    target: {
++        android_arm: {
++            srcs: ["vndk/v34/arm/libtinyxml2-v34.so"],
++        },
++        android_arm64: {
++            srcs: ["vndk/v34/arm64/libtinyxml2-v34.so"],
++        },
++    },
++    compile_multilib: "both",
++}
++
++cc_prebuilt_library_shared {
++    name: "libtinyxml2-v36",
++    vendor: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "liblog",
++        "libc++",
++        "libc",
++        "libm",
++        "libdl",
++    ],
++    target: {
++        android_arm: {
++            srcs: ["vndk/v36/arm/libtinyxml2-v36.so"],
++        },
++        android_arm64: {
++            srcs: ["vndk/v36/arm64/libtinyxml2-v36.so"],
++        },
++    },
++    compile_multilib: "both",
++}
++
++cc_library_shared {
++    name: "libcomparetf2_shim",
++    srcs: ["libcomparetf2/comparetf2.c"],
++    compile_multilib: "64",
++    vendor: true,
++}
++
++cc_prebuilt_library_shared {
++    name: "libprotobuf-cpp-full-3.9.1-vendorcompat",
++    stem: "libprotobuf-cpp-full-3.9.1",
++    ignore_max_page_size: true,
++    vendor: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "libc++",
++        "liblog",
++        "libz",
++    ],
++    target: {
++        android_arm64: {
++            srcs: ["libprotobuf/arm64/libprotobuf-cpp-full-3.9.1.so"],
++        },
++        android_arm: {
++            srcs: ["libprotobuf/arm/libprotobuf-cpp-full-3.9.1.so"],
++        },
++    },
++}
++
++cc_prebuilt_library_shared {
++    name: "libprotobuf-cpp-lite-3.9.1-vendorcompat",
++    stem: "libprotobuf-cpp-lite-3.9.1",
++    ignore_max_page_size: true,
++    vendor: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "libc++",
++        "liblog",
++    ],
++    target: {
++        android_arm64: {
++            srcs: ["libprotobuf/arm64/libprotobuf-cpp-lite-3.9.1.so"],
++        },
++        android_arm: {
++            srcs: ["libprotobuf/arm/libprotobuf-cpp-lite-3.9.1.so"],
++        },
++    },
++}
++
++cc_prebuilt_library_shared {
++    name: "libprotobuf-cpp-full-21.7",
++    system_ext_specific: true,
++    vendor_available: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "libc++",
++        "liblog",
++        "libz",
++    ],
++    target: {
++        android_arm: {
++            srcs: ["libprotobuf/arm/libprotobuf-cpp-full-21.7.so"],
++        },
++        android_arm64: {
++            srcs: ["libprotobuf/arm64/libprotobuf-cpp-full-21.7.so"],
++        },
++    },
++    compile_multilib: "both",
++}
++
++cc_prebuilt_library_shared {
++    name: "libprotobuf-cpp-lite-21.7",
++    system_ext_specific: true,
++    vendor_available: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "libc++",
++        "liblog",
++    ],
++    target: {
++        android_arm: {
++            srcs: ["libprotobuf/arm/libprotobuf-cpp-lite-21.7.so"],
++        },
++        android_arm64: {
++            srcs: ["libprotobuf/arm64/libprotobuf-cpp-lite-21.7.so"],
++        },
++    },
++    compile_multilib: "both",
++}
++
++cc_prebuilt_library_shared {
++    name: "libprotobuf-cpp-full-21.12-vendorcompat",
++    stem: "libprotobuf-cpp-full-21.12",
++    vendor: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "libc++",
++        "liblog",
++        "libz",
++    ],
++    target: {
++        android_arm: {
++            srcs: ["libprotobuf/arm/libprotobuf-cpp-full-21.12.so"],
++        },
++        android_arm64: {
++            srcs: select(soong_config_variable("lineageVarsPlugin", "TARGET_MAX_PAGE_SIZE_SUPPORTED"), {
++                "16384": ["libprotobuf/arm64_16k/libprotobuf-cpp-full-21.12.so"],
++                default: ["libprotobuf/arm64/libprotobuf-cpp-full-21.12.so"],
++            }),
++        },
++    },
++}
++
++cc_prebuilt_library_shared {
++    name: "libprotobuf-cpp-lite-21.12-vendorcompat",
++    stem: "libprotobuf-cpp-lite-21.12",
++    vendor: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "libc++",
++        "liblog",
++    ],
++    target: {
++        android_arm: {
++            srcs: ["libprotobuf/arm/libprotobuf-cpp-lite-21.12.so"],
++        },
++        android_arm64: {
++            srcs: select(soong_config_variable("lineageVarsPlugin", "TARGET_MAX_PAGE_SIZE_SUPPORTED"), {
++                "16384": ["libprotobuf/arm64_16k/libprotobuf-cpp-lite-21.12.so"],
++                default: ["libprotobuf/arm64/libprotobuf-cpp-lite-21.12.so"],
++            }),
++        },
++    },
++}
++
++cc_prebuilt_library_shared {
++    name: "libprotobuf-cpp-lite-21.12",
++    system_ext_specific: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "libc++",
++        "liblog",
++    ],
++    target: {
++        android_arm: {
++            srcs: ["libprotobuf/arm/libprotobuf-cpp-lite-21.12.so"],
++        },
++        android_arm64: {
++            srcs: select(soong_config_variable("lineageVarsPlugin", "TARGET_MAX_PAGE_SIZE_SUPPORTED"), {
++                "16384": ["libprotobuf/arm64_16k/libprotobuf-cpp-lite-21.12.so"],
++                default: ["libprotobuf/arm64/libprotobuf-cpp-lite-21.12.so"],
++            }),
++        },
++    },
++}
++
++cc_prebuilt_library_shared {
++    name: "libprotobuf-cpp-full-v29",
++    vendor: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "libc++",
++        "liblog",
++        "libz",
++    ],
++    target: {
++        android_arm: {
++            srcs: ["vndk/v29/arm/libprotobuf-cpp-full-v29.so"],
++        },
++        android_arm64: {
++            srcs: ["vndk/v29/arm64/libprotobuf-cpp-full-v29.so"],
++        },
++    },
++    compile_multilib: "both",
++}
++
++cc_prebuilt_library_shared {
++    name: "libprotobuf-cpp-lite-v29",
++    vendor: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "libc++",
++    ],
++    target: {
++        android_arm: {
++            srcs: ["vndk/v29/arm/libprotobuf-cpp-lite-v29.so"],
++        },
++        android_arm64: {
++            srcs: ["vndk/v29/arm64/libprotobuf-cpp-lite-v29.so"],
++        },
++    },
++    compile_multilib: "both",
++}
++
++cc_prebuilt_library_shared {
++    name: "libprotobuf-cpp-full-vendorcompat",
++    stem: "libprotobuf-cpp-full",
++    vendor: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "libc++",
++        "liblog",
++        "libz",
++    ],
++    target: {
++        android_arm: {
++            srcs: ["vndk/v29/arm/libprotobuf-cpp-full.so"],
++        },
++        android_arm64: {
++            srcs: ["vndk/v29/arm64/libprotobuf-cpp-full.so"],
++        },
++    },
++    compile_multilib: "both",
++}
++
++cc_prebuilt_library_shared {
++    name: "libprotobuf-cpp-lite-vendorcompat",
++    stem: "libprotobuf-cpp-lite",
++    vendor: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "libc++",
++    ],
++    target: {
++        android_arm: {
++            srcs: ["vndk/v29/arm/libprotobuf-cpp-lite.so"],
++        },
++        android_arm64: {
++            srcs: ["vndk/v29/arm64/libprotobuf-cpp-lite.so"],
++        },
++    },
++    compile_multilib: "both",
++}
++
++cc_prebuilt_library_shared {
++    name: "libstagefright_foundation-v33",
++    system_ext_specific: true,
++    vendor_available: true,
++    strip: {
++        none: true,
++    },
++    shared_libs: [
++        "libc++",
++        "libcutils",
++        "liblog",
++        "libutils",
++    ],
++    target: {
++        android_arm: {
++            srcs: ["vndk/v33/arm/libstagefright_foundation-v33.so"],
++        },
++        android_arm64: {
++            srcs: ["vndk/v33/arm64/libstagefright_foundation-v33.so"],
++        },
++    },
++    compile_multilib: "both",
++}
++
++java_library {
++    name: "telephony-common-stub",
++    installable: true,
++
++    srcs: [
++        "frameworks/telephony-common-stub/src/**/*.java",
++    ],
++}

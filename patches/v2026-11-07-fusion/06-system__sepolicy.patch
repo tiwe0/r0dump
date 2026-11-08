@@ -1,0 +1,171 @@
+diff --git a/contexts/file_contexts_test_data b/contexts/file_contexts_test_data
+index 59745708d7125ed61613d041056870b1faeb32a3..bd169a0ec8bc8e4cdbfc836df9295f420f8a4043 100644
+--- a/contexts/file_contexts_test_data
++++ b/contexts/file_contexts_test_data
+@@ -217,6 +217,7 @@
+ /dev/socket/property_service                                      property_socket
+ /dev/socket/property_service_for_system                           property_socket
+ /dev/socket/recovery                                              recovery_socket
++/dev/socket/r0dump_file_helper                                   r0dump_file_helper_socket
+ /dev/socket/rild                                                  rild_socket
+ /dev/socket/rild-debug                                            rild_debug_socket
+ /dev/socket/snapuserd                                             snapuserd_socket
+@@ -318,6 +319,7 @@
+ /system/bin/boringssl_self_test64                                 boringssl_self_test_exec
+ /system/bin/boringssl_self_test31                                 system_file
+ /system/bin/prng_seeder                                           prng_seeder_exec
++/system/bin/r0dump_file_helper                                    r0dump_file_helper_exec
+ /system/bin/charger                                               charger_exec
+ /system/bin/e2fsdroid                                             e2fs_exec
+ /system/bin/mke2fs                                                e2fs_exec
+diff --git a/private/file.te b/private/file.te
+index b832da44cf3fcf24018f85e53352b64182306718..5ff2175ecf95e04cf973abfb10c68dd2deeb6bdb 100644
+--- a/private/file.te
++++ b/private/file.te
+@@ -180,6 +180,10 @@ type aconfigd_socket, file_type, coredomain_socket, mlstrustedobject;
+ # Type for aconfig mainline daemon socket
+ type aconfigd_mainline_socket, file_type, coredomain_socket,  mlstrustedobject;
+ 
++# Private init socket and executable for synchronous r0dump output preparation.
++type r0dump_file_helper_socket, file_type, coredomain_socket;
++type r0dump_file_helper_exec, system_file_type, exec_type, file_type;
++
+ # Type for /(system|system_ext|product)/etc/aconfig
+ type system_aconfig_storage_file, system_file_type, file_type;
+ 
+diff --git a/private/file_contexts b/private/file_contexts
+index bc79eebf79c83eb8bb7dd4f28243d5e4ece8f92b..de8fa39fb53e1239272229f31e9d016eb0779910 100644
+--- a/private/file_contexts
++++ b/private/file_contexts
+@@ -288,6 +288,8 @@
+ /system/bin/incident   u:object_r:incident_exec:s0
+ /system/bin/incidentd   u:object_r:incidentd_exec:s0
+ /system/bin/incident_helper  u:object_r:incident_helper_exec:s0
++/system/bin/r0dump_file_helper  u:object_r:r0dump_file_helper_exec:s0
++/dev/socket/r0dump_file_helper  u:object_r:r0dump_file_helper_socket:s0
+ /system/bin/iw                   u:object_r:iw_exec:s0
+ /system/bin/netutils-wrapper-1\.0    u:object_r:netutils_wrapper_exec:s0
+ /system/bin/vold	u:object_r:vold_exec:s0
+diff --git a/private/property.te b/private/property.te
+index a9e13a3469bdcd085948cce9fca11eb16494fc2d..ebb498e13d3191823c6f8108aa2c9aee6c830b35 100644
+--- a/private/property.te
++++ b/private/property.te
+@@ -101,6 +101,7 @@ system_restricted_prop(persist_sysui_ranking_update_prop)
+ system_restricted_prop(page_size_prop)
+ system_restricted_prop(pm_16kb_app_compat_prop)
+ system_restricted_prop(remote_prov_prop)
++system_restricted_prop(r0dump_fusion_prop)
+ system_restricted_prop(service_sf_present_timestamp_prop)
+ system_restricted_prop(statsd_atoms_list_version_prop)
+ system_restricted_prop(trusty_coverage_prop)
+diff --git a/private/property_contexts b/private/property_contexts
+index b325c2ff025bfc65de36cfa1366c581046736fc1..a36a591a99a0280b5cfbbe43991fa761a0bef5bd 100644
+--- a/private/property_contexts
++++ b/private/property_contexts
+@@ -77,6 +77,7 @@ persist.pm.mock-upgrade u:object_r:mock_ota_prop:s0
+ persist.profcollectd.enabled    u:object_r:profcollectd_enabled_prop:s0     exact   bool
+ persist.profcollectd.node_id    u:object_r:profcollectd_node_id_prop:s0     exact   string
+ persist.sys.            u:object_r:system_prop:s0
++persist.sys.r0dump.fusion. u:object_r:r0dump_fusion_prop:s0 prefix string
+ persist.sys.safemode    u:object_r:safemode_prop:s0
+ persist.sys.tap_gesture u:object_r:gesture_prop:s0
+ persist.sys.theme       u:object_r:theme_prop:s0
+diff --git a/private/r0dump_file_helper.te b/private/r0dump_file_helper.te
+new file mode 100644
+index 0000000000000000000000000000000000000000..166eba02bc06574a6369c4ac69c429ddf69de6fb
+--- /dev/null
++++ b/private/r0dump_file_helper.te
+@@ -0,0 +1,54 @@
++type r0dump_file_helper, domain, coredomain;
++init_daemon_domain(r0dump_file_helper)
++
++# Captured app artifacts inherit the target app's MCS categories. The helper is
++# a platform daemon that validates and confines every request to the package
++# selected by system_server, so it must be able to cross those categories.
++typeattribute r0dump_file_helper mlstrustedsubject;
++
++get_prop(r0dump_file_helper, r0dump_fusion_prop)
++
++allow r0dump_file_helper self:capability { chown fowner fsetid setuid };
++allow r0dump_file_helper self:unix_stream_socket { accept listen read write getattr getopt setopt };
++
++# Traverse the per-user mount namespace before opening the FUSE-backed root.
++allow r0dump_file_helper mnt_user_file:dir search;
++
++# The emulated-storage FUSE daemon performs checks against the backing
++# media_rw data label while the helper walks and prepares app external files.
++allow r0dump_file_helper media_rw_data_file:dir create_dir_perms;
++allow r0dump_file_helper media_rw_data_file:file create_file_perms;
++
++# The helper performs only fd-relative directory preparation below app external files.
++allow r0dump_file_helper fuse:dir {
++  add_name
++  create
++  getattr
++  open
++  read
++  remove_name
++  rmdir
++  search
++  setattr
++  write
++};
++allow r0dump_file_helper fuse:file create_file_perms;
++
++# system_server opens the installed base/split APKs after validating the
++# Manager caller and passes only those read-only descriptors to the helper.
++allow r0dump_file_helper system_server:fd use;
++allow r0dump_file_helper apk_data_file:file { getattr read };
++
++allow system_server r0dump_file_helper_socket:sock_file write;
++allow system_server r0dump_file_helper:unix_stream_socket connectto;
++allow system_server r0dump_file_helper:fd use;
++# SELinux maps receipt of an O_PATH FD to the ioctl permission when no
++# FMODE_READ/FMODE_WRITE bit exists. This permits only FD receipt; the platform
++# neverallow still prevents system_server from opening, reading, or writing
++# external-storage directories.
++allow system_server fuse:dir ioctl;
++
++# The helper owns the directory file description even after system_server
++# duplicates it into a ParcelFileDescriptor. Only AMS can obtain and forward
++# this descriptor; its Binder entry validates the calling app UID/PID first.
++allow appdomain r0dump_file_helper:fd use;
+diff --git a/private/r0dump_manager_app.te b/private/r0dump_manager_app.te
+new file mode 100644
+index 0000000000000000000000000000000000000000..5dd50c81b2687f8ebe57f5e7cd175a8f48ef1b16
+--- /dev/null
++++ b/private/r0dump_manager_app.te
+@@ -0,0 +1,21 @@
++type r0dump_manager_app, domain;
++typeattribute r0dump_manager_app coredomain;
++
++app_domain(r0dump_manager_app)
++
++# Match the service discovery surface available to platform-signed privileged
++# apps.  The dedicated domain remains isolated from writer/session services.
++allow r0dump_manager_app app_api_service:service_manager find;
++allow r0dump_manager_app system_api_service:service_manager find;
++
++# Manager is the sole writer; configured targets and system_server only read.
++set_prop(r0dump_manager_app, r0dump_fusion_prop)
++get_prop(appdomain, r0dump_fusion_prop)
++get_prop(system_server, r0dump_fusion_prop)
++
++# MCP bridge: the app hosts an abstract-namespace stream socket ("r0dump_mcp")
++# that the r0dump_mcp_bridge relay (spawned in the shell domain by adb shell)
++# connects to. Keep this available in user builds too: access still requires
++# an authorized ADB shell and the Manager's explicit MCP toggle.
++allow r0dump_manager_app self:unix_stream_socket { create bind listen accept read write getopt setopt shutdown };
++allow shell r0dump_manager_app:unix_stream_socket connectto;
+diff --git a/private/seapp_contexts b/private/seapp_contexts
+index a6e829dd2028f9c8a7514ff2c90456e10b7e7dac..33a99ab197e27a00e55c9697cedb0d07dde2f939 100644
+--- a/private/seapp_contexts
++++ b/private/seapp_contexts
+@@ -167,6 +167,7 @@ isSystemServer=true domain=system_server_startup
+ neverallow user=_sdksandbox domain=((?!sdk_sandbox).)*
+ 
+ user=_app seinfo=platform name=com.android.traceur domain=traceur_app type=app_data_file levelFrom=all
++user=_app seinfo=platform isPrivApp=true name=com.android.r0dumpmanager domain=r0dump_manager_app type=privapp_data_file levelFrom=all
+ user=system seinfo=platform domain=system_app type=system_app_data_file
+ user=system seinfo=platform isPrivApp=true name=com.android.DeviceAsWebcam domain=device_as_webcam type=system_app_data_file levelFrom=all
+ user=bluetooth seinfo=bluetooth domain=bluetooth type=bluetooth_data_file

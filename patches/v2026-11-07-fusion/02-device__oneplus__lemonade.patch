@@ -1,0 +1,17 @@
+diff --git a/device.mk b/device.mk
+index 2016c0c0aa96903aff30ff2c4e09a0e7ce0160f7..72f6fde5f479ac7abb054bb65297504ab4e95d41 100644
+--- a/device.mk
++++ b/device.mk
+@@ -8,6 +8,12 @@
+ PRODUCT_AAPT_CONFIG := normal
+ PRODUCT_AAPT_PREF_CONFIG := xxhdpi
+ 
++# R0dump configuration manager
++PRODUCT_PACKAGES += \
++    R0dumpManager \
++    r0dump_file_helper \
++    r0dump_mcp_bridge
++
+ # Alert slider
+ PRODUCT_PACKAGES += \
+     KeyHandler \

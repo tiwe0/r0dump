@@ -1,0 +1,4770 @@
+diff --git a/core/java/android/app/ActivityThread.java b/core/java/android/app/ActivityThread.java
+index 6777dbaad9b90f5eeb28b679bef2931840c236f5..3ae042e2a3ffd1ae83c192b83b86f08cfdefa2f8 100644
+--- a/core/java/android/app/ActivityThread.java
++++ b/core/java/android/app/ActivityThread.java
+@@ -4487,6 +4487,8 @@ public final class ActivityThread extends ClientTransactionHandler
+                 r.mLastReportedWindowingMode = config.windowConfiguration.getWindowingMode();
+             }
+             r.setState(ON_CREATE);
++            r0dump_ClassLoaderWalk.r0dump_schedule(
++                    r0dump_FusionConfig.WALK_START_AFTER_FIRST_ACTIVITY_ON_CREATE);
+ 
+         } catch (SuperNotCalledException e) {
+             throw e;
+@@ -8006,6 +8008,10 @@ public final class ActivityThread extends ClientTransactionHandler
+ 
+         final IActivityManager mgr = ActivityManager.getService();
+         final ContextImpl appContext = ContextImpl.createAppContext(this, data.info);
++        final r0dump_FusionConfig r0dumpConfig =
++                r0dump_FusionConfig.r0dump_configureForApp(
++                        appContext, data.appInfo.packageName, data.processName);
++        r0dump_ClassLoaderWalk.r0dump_prepare(r0dumpConfig, data.info, data.appInfo);
+         mConfigurationController.updateLocaleListFromAppContext(appContext);
+ 
+         // Initialize the default http proxy in this process.
+@@ -8137,6 +8143,8 @@ public final class ActivityThread extends ClientTransactionHandler
+             try {
+                 timestampApplicationOnCreateNs = SystemClock.uptimeNanos();
+                 mInstrumentation.callApplicationOnCreate(app);
++                r0dump_ClassLoaderWalk.r0dump_schedule(
++                        r0dump_FusionConfig.WALK_START_AFTER_APPLICATION_ON_CREATE);
+             } catch (Exception e) {
+                 timestampApplicationOnCreateNs = 0;
+                 if (!mInstrumentation.onException(app, e)) {
+diff --git a/core/java/android/app/IActivityManager.aidl b/core/java/android/app/IActivityManager.aidl
+index 7a6ace796b4b95c025cccafb921e07d7250c3bc8..9abff2a9c4ffa408e4420670574978fb314cd22a 100644
+--- a/core/java/android/app/IActivityManager.aidl
++++ b/core/java/android/app/IActivityManager.aidl
+@@ -702,6 +702,13 @@ interface IActivityManager {
+      */
+     List<String> getDelegatedShellPermissions();
+ 
++    /** @hide Creates the trusted r0dump output tree and returns its process directory. */
++    ParcelFileDescriptor r0dump_prepareOutput(
++            String packageName, String processName, String runId, long generation);
++
++    /** @hide Repairs and exports the newest r0dump run for an installed package. */
++    ParcelFileDescriptor r0dump_exportLatest(String packageName);
++
+     /** Returns a file descriptor that'll be closed when the system server process dies. */
+     ParcelFileDescriptor getLifeMonitor();
+ 
+diff --git a/core/java/android/app/r0dump_ClassLoaderWalk.java b/core/java/android/app/r0dump_ClassLoaderWalk.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..8f2a5ea875931d0c5e41af172c18b7550a8eb105
+--- /dev/null
++++ b/core/java/android/app/r0dump_ClassLoaderWalk.java
+@@ -0,0 +1,639 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.app;
++
++import android.content.pm.ApplicationInfo;
++import dalvik.system.r0dump_Runtime;
++import java.lang.reflect.Constructor;
++import java.lang.reflect.Executable;
++import java.lang.reflect.Method;
++import java.lang.reflect.Modifier;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Comparator;
++import java.util.HashSet;
++import java.util.IdentityHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.concurrent.atomic.AtomicReference;
++
++/** Process-local, bounded ClassLoader inventory for r0dump. */
++final class r0dump_ClassLoaderWalk {
++  private static final int r0dump_SOURCE_COOKIE = 0;
++  private static final int r0dump_SOURCE_LOADED_TABLE = 1;
++  private static final int r0dump_SOURCE_MANIFEST = 2;
++  private static final int r0dump_SOURCE_DEX_CACHE = 3;
++
++  private static final AtomicReference<r0dump_Request> r0dump_REQUEST = new AtomicReference<>();
++
++  private static final class r0dump_Request {
++    final r0dump_FusionConfig config;
++    final LoadedApk loadedApk;
++    final ApplicationInfo appInfo;
++
++    r0dump_Request(r0dump_FusionConfig config, LoadedApk loadedApk, ApplicationInfo appInfo) {
++      this.config = config;
++      this.loadedApk = loadedApk;
++      this.appInfo = new ApplicationInfo(appInfo);
++    }
++  }
++
++  private static final class r0dump_State {
++    final int maxClasses;
++    final int maxExecutables;
++    final IdentityHashMap<ClassLoader, HashSet<String>> seenClasses = new IdentityHashMap<>();
++    int classCount;
++    int executableCount;
++
++    r0dump_State(r0dump_FusionConfig config) {
++      maxClasses = (int) config.walkMaxClasses;
++      maxExecutables = (int) config.walkMaxMethods;
++    }
++
++    boolean r0dump_hasClassBudget() {
++      return classCount < maxClasses && executableCount < maxExecutables;
++    }
++
++    boolean r0dump_markClass(ClassLoader loader, String className) {
++      HashSet<String> names = seenClasses.get(loader);
++      if (names == null) {
++        names = new HashSet<>();
++        seenClasses.put(loader, names);
++      }
++      if (!names.add(className)) {
++        return false;
++      }
++      classCount++;
++      return true;
++    }
++  }
++
++  private static final class r0dump_ForceState {
++    final int maxClasses;
++    final int maxExecutables;
++    final int maxAttempts;
++    final List<String> namespacePrefixes;
++    final IdentityHashMap<ClassLoader, HashSet<String>> seenNames = new IdentityHashMap<>();
++    final IdentityHashMap<Class<?>, Boolean> seenClasses = new IdentityHashMap<>();
++    int classCount;
++    int executableCount;
++    int attemptCount;
++
++    r0dump_ForceState(
++        r0dump_FusionConfig config, List<String> namespacePrefixes, int priorAttempts) {
++      maxClasses = (int) config.walkMaxClasses;
++      maxExecutables = (int) config.walkMaxMethods;
++      maxAttempts = (int) config.forceMaxCalls;
++      this.namespacePrefixes = namespacePrefixes;
++      attemptCount = priorAttempts;
++    }
++
++    boolean r0dump_hasBudget() {
++      return classCount < maxClasses
++          && executableCount < maxExecutables
++          && attemptCount < maxAttempts;
++    }
++
++    boolean r0dump_markName(ClassLoader loader, String className) {
++      HashSet<String> names = seenNames.get(loader);
++      if (names == null) {
++        names = new HashSet<>();
++        seenNames.put(loader, names);
++      }
++      if (!names.add(className)) {
++        return false;
++      }
++      classCount++;
++      return true;
++    }
++  }
++
++  private r0dump_ClassLoaderWalk() {}
++
++  static void r0dump_prepare(
++      r0dump_FusionConfig config, LoadedApk loadedApk, ApplicationInfo appInfo) {
++    if (config == null || loadedApk == null || appInfo == null) {
++      return;
++    }
++    r0dump_REQUEST.compareAndSet(null, new r0dump_Request(config, loadedApk, appInfo));
++  }
++
++  static void r0dump_schedule(int walkStart) {
++    final r0dump_Request request = r0dump_REQUEST.get();
++    if (request == null || request.config.walkStart != walkStart) {
++      return;
++    }
++    final ClassLoader contextLoader = Thread.currentThread().getContextClassLoader();
++    r0dump_FileWorker.r0dump_schedule(
++        request.config.walkDelayMs, () -> r0dump_run(request, contextLoader));
++  }
++
++  private static boolean r0dump_run(r0dump_Request request, ClassLoader contextLoader) {
++    final r0dump_ManifestHelper.r0dump_Snapshot r0dump_manifest;
++    if (request.config.manifestEnabled) {
++      r0dump_manifest =
++          r0dump_ManifestHelper.r0dump_parse(
++              request.loadedApk,
++              request.appInfo,
++              request.config.targetPackage,
++              request.config.manifestIncludeSplits,
++              new r0dump_ManifestHelper.r0dump_Limits(
++                  (int) request.config.manifestMaxComponents,
++                  (int) request.config.manifestMaxSplits,
++                  (int) request.config.manifestMaxEventsPerSource,
++                  (int) request.config.manifestMaxTotalEvents,
++                  (int) request.config.manifestMaxXmlDepth,
++                  (int) request.config.manifestMaxAttributeLength));
++      r0dump_publishManifestSnapshot(r0dump_manifest);
++    } else {
++      r0dump_manifest = null;
++    }
++    if (request.config.walkEnabled || request.config.forceInvokeEnabled) {
++      final ClassLoader applicationLoader;
++      try {
++        applicationLoader = request.loadedApk.getClassLoader();
++      } catch (RuntimeException e) {
++        return false;
++      }
++
++      final ArrayList<ClassLoader> loaders = new ArrayList<>();
++      final IdentityHashMap<ClassLoader, Boolean> seenLoaders = new IdentityHashMap<>();
++      r0dump_addLoaderChain(applicationLoader, loaders, seenLoaders);
++      r0dump_addLoaderChain(contextLoader, loaders, seenLoaders);
++      try {
++        final ClassLoader[] registeredLoaders = r0dump_Runtime.r0dump_GetRegisteredClassLoaders();
++        if (registeredLoaders != null) {
++          for (ClassLoader loader : registeredLoaders) {
++            r0dump_addLoaderChain(loader, loaders, seenLoaders);
++          }
++        }
++      } catch (RuntimeException | LinkageError ignored) {
++      }
++
++      if (request.config.walkEnabled) {
++        final r0dump_State state = new r0dump_State(request.config);
++        for (ClassLoader loader : loaders) {
++          if (!state.r0dump_hasClassBudget()) {
++            break;
++          }
++          r0dump_walkCookieNames(request.config, loader, state);
++          if (!state.r0dump_hasClassBudget()) {
++            break;
++          }
++          r0dump_walkDexCacheNames(request.config, loader, state);
++          if (!state.r0dump_hasClassBudget()) {
++            break;
++          }
++          try {
++            r0dump_walkNames(
++                request.config,
++                loader,
++                r0dump_Runtime.r0dump_GetLoadedClassNames(loader),
++                null,
++                r0dump_SOURCE_LOADED_TABLE,
++                state);
++          } catch (RuntimeException | LinkageError ignored) {
++          }
++          if (loader == applicationLoader
++              && request.config.manifestEnabled
++              && state.r0dump_hasClassBudget()) {
++            r0dump_walkManifestNames(r0dump_manifest, request.config, applicationLoader, state);
++          }
++        }
++      }
++      if (request.config.forceInvokeEnabled) {
++        final int priorAttempts = r0dump_forceInvokeExact(request.config, loaders);
++        r0dump_forceManifestNamespaces(
++            r0dump_manifest, request.config, applicationLoader, loaders, priorAttempts);
++      }
++    }
++    return true;
++  }
++
++  private static void r0dump_publishManifestSnapshot(
++      r0dump_ManifestHelper.r0dump_Snapshot snapshot) {
++    final int seedCount = snapshot.seeds.size();
++    final String[] classNames = new String[seedCount];
++    final String[] seedKinds = new String[seedCount];
++    final int[] sourceOrdinals = new int[seedCount];
++    for (int i = 0; i < seedCount; i++) {
++      final r0dump_ManifestHelper.r0dump_ClassSeed seed = snapshot.seeds.get(i);
++      classNames[i] = seed.className;
++      seedKinds[i] = seed.kind.name();
++      sourceOrdinals[i] = seed.sourceOrdinal;
++    }
++    final int sourceCount = snapshot.sources.size();
++    final String[] sourceKinds = new String[sourceCount];
++    final String[] sourceStatuses = new String[sourceCount];
++    final int[] sourceEventCounts = new int[sourceCount];
++    final String[] sourceLimitHits = new String[sourceCount];
++    for (int i = 0; i < sourceCount; i++) {
++      final r0dump_ManifestHelper.r0dump_ManifestSource source = snapshot.sources.get(i);
++      sourceKinds[i] =
++          source.kind == r0dump_ManifestHelper.r0dump_SourceKind.BASE ? "base" : "split";
++      sourceStatuses[i] = source.status.name();
++      sourceEventCounts[i] = source.eventCount;
++      sourceLimitHits[i] =
++          source.limitHit == r0dump_ManifestHelper.r0dump_LimitKind.NONE
++              ? null
++              : source.limitHit.name();
++    }
++    r0dump_Runtime.r0dump_PublishManifestSnapshot(
++        snapshot.status.name(),
++        snapshot.packageName,
++        classNames,
++        seedKinds,
++        sourceOrdinals,
++        sourceKinds,
++        sourceStatuses,
++        sourceEventCounts,
++        sourceLimitHits,
++        snapshot.sourceCount,
++        snapshot.parsedSourceCount,
++        snapshot.rejectedSourceCount,
++        snapshot.xmlEventCount,
++        snapshot.limitHit == r0dump_ManifestHelper.r0dump_LimitKind.NONE
++            ? null
++            : snapshot.limitHit.name());
++  }
++
++  private static void r0dump_addLoaderChain(
++      ClassLoader loader,
++      ArrayList<ClassLoader> loaders,
++      IdentityHashMap<ClassLoader, Boolean> seenLoaders) {
++    for (ClassLoader current = loader;
++        current != null && seenLoaders.put(current, Boolean.TRUE) == null;
++        current = current.getParent()) {
++      loaders.add(current);
++    }
++  }
++
++  private static void r0dump_walkCookieNames(
++      r0dump_FusionConfig config, ClassLoader loader, r0dump_State state) {
++    final Object[] cookies;
++    try {
++      cookies = r0dump_Runtime.r0dump_GetDexCookies(loader);
++    } catch (RuntimeException | LinkageError e) {
++      return;
++    }
++    if (cookies == null) {
++      return;
++    }
++    for (Object cookie : cookies) {
++      if (cookie == null || !state.r0dump_hasClassBudget()) {
++        continue;
++      }
++      try {
++        r0dump_Runtime.r0dump_CaptureCookie(cookie, r0dump_SOURCE_COOKIE);
++        r0dump_walkNames(
++            config,
++            loader,
++            r0dump_Runtime.r0dump_GetCookieClassNames(cookie),
++            cookie,
++            r0dump_SOURCE_COOKIE,
++            state);
++      } catch (RuntimeException | LinkageError ignored) {
++      }
++    }
++  }
++
++  private static void r0dump_walkDexCacheNames(
++      r0dump_FusionConfig config, ClassLoader loader, r0dump_State state) {
++    if (loader == null || !state.r0dump_hasClassBudget()) {
++      return;
++    }
++    try {
++      r0dump_walkNames(
++          config,
++          loader,
++          r0dump_Runtime.r0dump_GetDexCacheClassNames(loader, config.walkNamespacePrefix),
++          null,
++          r0dump_SOURCE_DEX_CACHE,
++          state);
++    } catch (RuntimeException | LinkageError ignored) {
++    }
++  }
++
++  private static void r0dump_walkManifestNames(
++      r0dump_ManifestHelper.r0dump_Snapshot snapshot,
++      r0dump_FusionConfig config,
++      ClassLoader applicationLoader,
++      r0dump_State state) {
++    if (snapshot == null) {
++      return;
++    }
++    final String[] names = new String[snapshot.seeds.size()];
++    for (int i = 0; i < snapshot.seeds.size(); i++) {
++      names[i] = snapshot.seeds.get(i).className;
++    }
++    r0dump_walkNames(config, applicationLoader, names, null, r0dump_SOURCE_MANIFEST, state);
++  }
++
++  private static void r0dump_walkNames(
++      r0dump_FusionConfig config,
++      ClassLoader loader,
++      String[] classNames,
++      Object cookie,
++      int sourceId,
++      r0dump_State state) {
++    if (classNames == null) {
++      return;
++    }
++    for (String className : classNames) {
++      if (!state.r0dump_hasClassBudget()) {
++        return;
++      }
++      if (className == null
++          || className.isEmpty()
++          || !r0dump_matchesConfiguredNamespace(config, className)
++          || !state.r0dump_markClass(loader, className)) {
++        continue;
++      }
++      try {
++        final Class<?> klass =
++            config.walkMode == r0dump_FusionConfig.WALK_MODE_LOADED_ONLY
++                ? r0dump_Runtime.r0dump_FindLoadedClass(loader, className)
++                : Class.forName(className, false, loader);
++        if (klass != null) {
++          r0dump_captureExecutables(klass, cookie, className, sourceId, state);
++        }
++      } catch (ClassNotFoundException | SecurityException | LinkageError ignored) {
++      }
++    }
++  }
++
++  private static boolean r0dump_matchesConfiguredNamespace(
++      r0dump_FusionConfig config, String className) {
++    return config.walkNamespacePrefix.isEmpty()
++        || (className != null && className.startsWith(config.walkNamespacePrefix));
++  }
++
++  private static void r0dump_captureExecutables(
++      Class<?> klass, Object cookie, String className, int sourceId, r0dump_State state) {
++    final Method[] methods;
++    final Constructor<?>[] constructors;
++    try {
++      methods = klass.getDeclaredMethods();
++      constructors = klass.getDeclaredConstructors();
++    } catch (SecurityException | LinkageError e) {
++      return;
++    }
++    for (Method method : methods) {
++      if (state.executableCount >= state.maxExecutables) {
++        return;
++      }
++      state.executableCount++;
++      try {
++        r0dump_Runtime.r0dump_CaptureExecutable(method, cookie, className, sourceId);
++      } catch (RuntimeException | LinkageError ignored) {
++      }
++    }
++    for (Constructor<?> constructor : constructors) {
++      if (state.executableCount >= state.maxExecutables) {
++        return;
++      }
++      state.executableCount++;
++      try {
++        r0dump_Runtime.r0dump_CaptureExecutable(constructor, cookie, className, sourceId);
++      } catch (RuntimeException | LinkageError ignored) {
++      }
++    }
++  }
++
++  private static int r0dump_forceInvokeExact(
++      r0dump_FusionConfig config, ArrayList<ClassLoader> loaders) {
++    if (!config.forceInvokeEnabled
++        || config.forceClass.isEmpty()
++        || config.forceMethod.isEmpty()
++        || config.forceMethodDescriptor.isEmpty()) {
++      return 0;
++    }
++    final IdentityHashMap<Class<?>, Boolean> seenClasses = new IdentityHashMap<>();
++    for (ClassLoader loader : loaders) {
++      try {
++        final Class<?> klass = Class.forName(config.forceClass, false, loader);
++        if (seenClasses.put(klass, Boolean.TRUE) != null) {
++          continue;
++        }
++        final Executable executable = r0dump_findForceExecutable(klass, config);
++        if (executable != null) {
++          r0dump_Runtime.r0dump_ForceInvoke(executable, null, config.forceClass);
++          return 1;
++        }
++      } catch (ClassNotFoundException | SecurityException | LinkageError ignored) {
++      }
++    }
++    return 0;
++  }
++
++  private static void r0dump_forceManifestNamespaces(
++      r0dump_ManifestHelper.r0dump_Snapshot snapshot,
++      r0dump_FusionConfig config,
++      ClassLoader applicationLoader,
++      ArrayList<ClassLoader> loaders,
++      int priorAttempts) {
++    final LinkedHashSet<String> prefixSet = new LinkedHashSet<>();
++    if (!config.walkNamespacePrefix.isEmpty()) {
++      prefixSet.add(config.walkNamespacePrefix);
++    }
++    prefixSet.addAll(r0dump_manifestNamespacePrefixes(snapshot));
++    final List<String> prefixes = new ArrayList<>(prefixSet);
++    if (!config.forceInvokeEnabled || prefixes.isEmpty() || priorAttempts >= config.forceMaxCalls) {
++      return;
++    }
++    final r0dump_ForceState state = new r0dump_ForceState(config, prefixes, priorAttempts);
++    if (snapshot != null) {
++      final String[] seedNames = new String[snapshot.seeds.size()];
++      for (int i = 0; i < snapshot.seeds.size(); i++) {
++        seedNames[i] = snapshot.seeds.get(i).className;
++      }
++      r0dump_forceNames(applicationLoader, seedNames, state);
++    }
++    for (ClassLoader loader : loaders) {
++      if (!state.r0dump_hasBudget()) {
++        return;
++      }
++      try {
++        final Object[] cookies = r0dump_Runtime.r0dump_GetDexCookies(loader);
++        if (cookies != null) {
++          for (Object cookie : cookies) {
++            if (cookie != null && state.r0dump_hasBudget()) {
++              r0dump_forceNames(loader, r0dump_Runtime.r0dump_GetCookieClassNames(cookie), state);
++            }
++          }
++        }
++      } catch (RuntimeException | LinkageError ignored) {
++      }
++      if (!state.r0dump_hasBudget()) {
++        return;
++      }
++      try {
++        r0dump_forceNames(loader, r0dump_Runtime.r0dump_GetLoadedClassNames(loader), state);
++      } catch (RuntimeException | LinkageError ignored) {
++      }
++    }
++  }
++
++  static List<String> r0dump_manifestNamespacePrefixes(
++      r0dump_ManifestHelper.r0dump_Snapshot snapshot) {
++    if (snapshot == null) {
++      return List.of();
++    }
++    final LinkedHashSet<String> candidates = new LinkedHashSet<>();
++    for (r0dump_ManifestHelper.r0dump_ClassSeed seed : snapshot.seeds) {
++      if (seed == null || seed.className == null) {
++        continue;
++      }
++      final int separator = seed.className.lastIndexOf('.');
++      if (separator > 0) {
++        candidates.add(seed.className.substring(0, separator + 1));
++      }
++    }
++    final ArrayList<String> sorted = new ArrayList<>(candidates);
++    sorted.sort(Comparator.comparingInt(String::length).thenComparing(Comparator.naturalOrder()));
++    final ArrayList<String> minimal = new ArrayList<>();
++    for (String candidate : sorted) {
++      if (!r0dump_matchesNamespace(candidate, minimal)) {
++        minimal.add(candidate);
++      }
++    }
++    return List.copyOf(minimal);
++  }
++
++  static boolean r0dump_matchesNamespace(String className, List<String> prefixes) {
++    if (className == null || prefixes == null) {
++      return false;
++    }
++    for (String prefix : prefixes) {
++      if (prefix != null && !prefix.isEmpty() && className.startsWith(prefix)) {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  private static void r0dump_forceNames(
++      ClassLoader loader, String[] classNames, r0dump_ForceState state) {
++    if (loader == null || classNames == null) {
++      return;
++    }
++    for (String className : classNames) {
++      if (!state.r0dump_hasBudget()) {
++        return;
++      }
++      if (className == null
++          || className.isEmpty()
++          || !r0dump_matchesNamespace(className, state.namespacePrefixes)
++          || !state.r0dump_markName(loader, className)) {
++        continue;
++      }
++      try {
++        final Class<?> klass = Class.forName(className, false, loader);
++        if (state.seenClasses.put(klass, Boolean.TRUE) == null) {
++          r0dump_forceExecutables(klass, className, state);
++        }
++      } catch (ClassNotFoundException | SecurityException | LinkageError ignored) {
++      }
++    }
++  }
++
++  private static void r0dump_forceExecutables(
++      Class<?> klass, String className, r0dump_ForceState state) {
++    final ArrayList<Executable> executables = new ArrayList<>();
++    try {
++      executables.addAll(Arrays.asList(klass.getDeclaredConstructors()));
++      executables.addAll(Arrays.asList(klass.getDeclaredMethods()));
++    } catch (SecurityException | LinkageError e) {
++      return;
++    }
++    executables.sort(Comparator.comparing(r0dump_ClassLoaderWalk::r0dump_executableSortKey));
++    for (Executable executable : executables) {
++      if (!state.r0dump_hasBudget()) {
++        return;
++      }
++      state.executableCount++;
++      final int modifiers = executable.getModifiers();
++      if (Modifier.isAbstract(modifiers) || Modifier.isNative(modifiers)) {
++        continue;
++      }
++      state.attemptCount++;
++      try {
++        r0dump_Runtime.r0dump_ForceInvoke(executable, null, className);
++      } catch (RuntimeException | LinkageError ignored) {
++      }
++    }
++  }
++
++  private static String r0dump_executableSortKey(Executable executable) {
++    final String name = executable instanceof Constructor ? "<init>" : executable.getName();
++    return name + r0dump_descriptor(executable);
++  }
++
++  private static Executable r0dump_findForceExecutable(Class<?> klass, r0dump_FusionConfig config) {
++    Executable match = null;
++    for (Method method : klass.getDeclaredMethods()) {
++      if (config.forceMethod.equals(method.getName())
++          && config.forceMethodDescriptor.equals(r0dump_descriptor(method))) {
++        if (match != null) {
++          return null;
++        }
++        match = method;
++      }
++    }
++    for (Constructor<?> constructor : klass.getDeclaredConstructors()) {
++      if ("<init>".equals(config.forceMethod)
++          && config.forceMethodDescriptor.equals(r0dump_descriptor(constructor))) {
++        if (match != null) {
++          return null;
++        }
++        match = constructor;
++      }
++    }
++    return match;
++  }
++
++  private static String r0dump_descriptor(Executable executable) {
++    final StringBuilder descriptor = new StringBuilder("(");
++    for (Class<?> parameterType : executable.getParameterTypes()) {
++      descriptor.append(r0dump_descriptor(parameterType));
++    }
++    descriptor.append(')');
++    descriptor.append(
++        executable instanceof Method
++            ? r0dump_descriptor(((Method) executable).getReturnType())
++            : "V");
++    return descriptor.toString();
++  }
++
++  private static String r0dump_descriptor(Class<?> type) {
++    if (type.isPrimitive()) {
++      if (type == void.class) return "V";
++      if (type == boolean.class) return "Z";
++      if (type == byte.class) return "B";
++      if (type == char.class) return "C";
++      if (type == short.class) return "S";
++      if (type == int.class) return "I";
++      if (type == long.class) return "J";
++      if (type == float.class) return "F";
++      return "D";
++    }
++    if (type.isArray()) {
++      return type.getName().replace('.', '/');
++    }
++    return "L" + type.getName().replace('.', '/') + ";";
++  }
++}
+diff --git a/core/java/android/app/r0dump_FileWorker.java b/core/java/android/app/r0dump_FileWorker.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..1ae3830322656846a11c77a0b80bbb80e26beb9b
+--- /dev/null
++++ b/core/java/android/app/r0dump_FileWorker.java
+@@ -0,0 +1,76 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.app;
++
++import android.os.SystemClock;
++import dalvik.system.r0dump_Runtime;
++import java.util.concurrent.atomic.AtomicBoolean;
++
++interface r0dump_Work {
++  boolean r0dump_run();
++}
++
++/** The sole process-local daemon responsible for deferred r0dump file flushing. */
++final class r0dump_FileWorker {
++  private static final String r0dump_WORKER_NAME = "r0dump-fusion-writer";
++  private static final AtomicBoolean r0dump_SCHEDULED = new AtomicBoolean();
++
++  private r0dump_FileWorker() {}
++
++  static void r0dump_schedule(long delayMs, r0dump_Work work) {
++    if (work == null || !r0dump_SCHEDULED.compareAndSet(false, true)) {
++      return;
++    }
++    final Thread worker =
++        new Thread(
++            () -> {
++              boolean r0dump_completed = false;
++              try {
++                r0dump_waitAndServiceFlush(delayMs);
++                r0dump_completed = work.r0dump_run();
++              } finally {
++                boolean r0dump_due = r0dump_Runtime.r0dump_CompleteWalk(r0dump_completed);
++                while (r0dump_due) {
++                  r0dump_due = r0dump_Runtime.r0dump_ServiceFlush();
++                }
++                r0dump_serviceFlushForever();
++              }
++            },
++            r0dump_WORKER_NAME);
++    worker.setDaemon(true);
++    worker.start();
++  }
++
++  private static void r0dump_waitAndServiceFlush(long delayMs) {
++    long r0dump_remaining = delayMs;
++    do {
++      final long r0dump_slice = Math.min(r0dump_remaining, 500L);
++      if (r0dump_slice > 0L) {
++        SystemClock.sleep(r0dump_slice);
++        r0dump_remaining -= r0dump_slice;
++      }
++      while (r0dump_Runtime.r0dump_ServiceFlush()) {}
++    } while (r0dump_remaining > 0L);
++  }
++
++  private static void r0dump_serviceFlushForever() {
++    while (true) {
++      SystemClock.sleep(250L);
++      while (r0dump_Runtime.r0dump_ServiceFlush()) {}
++    }
++  }
++}
+diff --git a/core/java/android/app/r0dump_FusionConfig.java b/core/java/android/app/r0dump_FusionConfig.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c82376c15cd26fe1a093c70bb7362d69a3cc534d
+--- /dev/null
++++ b/core/java/android/app/r0dump_FusionConfig.java
+@@ -0,0 +1,1196 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.app;
++
++import android.content.Context;
++import android.net.LocalSocket;
++import android.os.ParcelFileDescriptor;
++import android.os.Process;
++import android.os.RemoteException;
++import android.os.SystemProperties;
++import android.os.UserHandle;
++import android.util.JsonReader;
++import android.util.JsonToken;
++import android.util.Slog;
++import dalvik.system.r0dump_Runtime;
++import java.io.File;
++import java.io.FileDescriptor;
++import java.io.IOException;
++import java.io.StringReader;
++import java.nio.charset.StandardCharsets;
++import java.util.HashSet;
++import java.util.Iterator;
++import java.util.Locale;
++import java.util.Set;
++import org.json.JSONException;
++import org.json.JSONObject;
++
++/**
++ * Process-local, immutable r0dump configuration parsed during application bind.
++ *
++ * @hide
++ */
++public final class r0dump_FusionConfig {
++  static final int MAX_JSON_BYTES = 8192;
++  static final int WALK_START_AFTER_APPLICATION_ON_CREATE = 0;
++  static final int WALK_START_AFTER_FIRST_ACTIVITY_ON_CREATE = 1;
++  static final int WALK_MODE_LOADED_ONLY = 0;
++  static final int WALK_MODE_DEX_NAMES = 1;
++
++  private static final String TAG = "R0dumpFusion";
++  static final String PROPERTY_PREFIX = "persist.sys.r0dump.fusion.";
++  private static final String PROPERTY_GENERATION = PROPERTY_PREFIX + "generation";
++  private static final long DEFINED_CAPTURE_POINT_MASK = (1L << 43) - 1L;
++  private static final long FORCE_INVOKE_NO_EXECUTE_BIT = 1L << 41;
++  private static final long MAX_UNSIGNED_INT = 0xffff_ffffL;
++  private static final r0dump_PropertyAccess SYSTEM_PROPERTIES =
++      new r0dump_PropertyAccess() {
++        @Override
++        public String r0dump_get(String key, String defaultValue) {
++          return SystemProperties.get(key, defaultValue);
++        }
++
++        @Override
++        public void r0dump_set(String key, String value) {
++          SystemProperties.set(key, value);
++        }
++      };
++
++  private static final Set<String> FIELDS =
++      Set.of(
++          "schema",
++          "enabled",
++          "run_id",
++          "target_package",
++          "target_process",
++          "capture_point_mask",
++          "max_records",
++          "max_artifacts",
++          "max_total_bytes",
++          "max_dex_bytes",
++          "buffer_pool_bytes",
++          "max_code_item_bytes",
++          "max_frozen_generations",
++          "flush_idle_ms",
++          "manifest_enabled",
++          "manifest_include_splits",
++          "manifest_max_components",
++          "manifest_max_splits",
++          "manifest_max_events_per_source",
++          "manifest_max_total_events",
++          "manifest_max_xml_depth",
++          "manifest_max_attribute_length",
++          "walk_enabled",
++          "walk_start",
++          "walk_mode",
++          "walk_namespace_prefix",
++          "walk_delay_ms",
++          "walk_max_classes",
++          "walk_max_methods",
++          "force_invoke_enabled",
++          "force_class",
++          "force_method",
++          "force_method_descriptor",
++          "force_max_calls",
++          "anr_protection_enabled");
++
++  final int schema;
++  final boolean enabled;
++  final String runId;
++  final String targetPackage;
++  final String targetProcess;
++  final long capturePointMask;
++  final long maxRecords;
++  final long maxArtifacts;
++  final long maxTotalBytes;
++  final long maxDexBytes;
++  final long bufferPoolBytes;
++  final long maxCodeItemBytes;
++  final long maxFrozenGenerations;
++  final long flushIdleMs;
++  final boolean manifestEnabled;
++  final boolean manifestIncludeSplits;
++  final long manifestMaxComponents;
++  final long manifestMaxSplits;
++  final long manifestMaxEventsPerSource;
++  final long manifestMaxTotalEvents;
++  final long manifestMaxXmlDepth;
++  final long manifestMaxAttributeLength;
++  final boolean walkEnabled;
++  final int walkStart;
++  final int walkMode;
++  final String walkNamespacePrefix;
++  final long walkDelayMs;
++  final long walkMaxClasses;
++  final long walkMaxMethods;
++  final boolean forceInvokeEnabled;
++  final String forceClass;
++  final String forceMethod;
++  final String forceMethodDescriptor;
++  final long forceMaxCalls;
++  final boolean anrProtectionEnabled;
++  private long persistedGeneration = -1L;
++
++  private r0dump_FusionConfig(JSONObject json) throws JSONException {
++    schema = r0dump_requireInt(json, "schema");
++    enabled = r0dump_requireBoolean(json, "enabled");
++    runId = r0dump_requireString(json, "run_id");
++    targetPackage = r0dump_requireString(json, "target_package");
++    targetProcess = r0dump_requireString(json, "target_process");
++    capturePointMask = r0dump_parseMask(r0dump_requireString(json, "capture_point_mask"));
++    maxRecords = r0dump_requireUnsignedInt(json, "max_records");
++    maxArtifacts = r0dump_requireUnsignedInt(json, "max_artifacts");
++    maxTotalBytes = r0dump_requirePositiveLong(json, "max_total_bytes");
++    maxDexBytes = r0dump_requirePositiveLong(json, "max_dex_bytes");
++    bufferPoolBytes = r0dump_requirePositiveLong(json, "buffer_pool_bytes");
++    maxCodeItemBytes = r0dump_requirePositiveLong(json, "max_code_item_bytes");
++    maxFrozenGenerations = r0dump_requireUnsignedInt(json, "max_frozen_generations");
++    flushIdleMs = r0dump_requireUnsignedInt(json, "flush_idle_ms");
++    manifestEnabled = r0dump_requireBoolean(json, "manifest_enabled");
++    manifestIncludeSplits = r0dump_requireBoolean(json, "manifest_include_splits");
++    manifestMaxComponents = r0dump_requireUnsignedInt(json, "manifest_max_components");
++    manifestMaxSplits = r0dump_requireUnsignedInt(json, "manifest_max_splits");
++    manifestMaxEventsPerSource = r0dump_requireUnsignedInt(json, "manifest_max_events_per_source");
++    manifestMaxTotalEvents = r0dump_requireUnsignedInt(json, "manifest_max_total_events");
++    manifestMaxXmlDepth = r0dump_requireUnsignedInt(json, "manifest_max_xml_depth");
++    manifestMaxAttributeLength = r0dump_requireUnsignedInt(json, "manifest_max_attribute_length");
++    walkEnabled = r0dump_requireBoolean(json, "walk_enabled");
++    walkStart = r0dump_parseWalkStart(r0dump_requireString(json, "walk_start"));
++    walkMode = r0dump_parseWalkMode(r0dump_requireString(json, "walk_mode"));
++    walkNamespacePrefix = r0dump_requireString(json, "walk_namespace_prefix");
++    walkDelayMs = r0dump_requireUnsignedInt(json, "walk_delay_ms");
++    walkMaxClasses = r0dump_requireUnsignedInt(json, "walk_max_classes");
++    walkMaxMethods = r0dump_requireUnsignedInt(json, "walk_max_methods");
++    forceInvokeEnabled = r0dump_requireBoolean(json, "force_invoke_enabled");
++    forceClass = r0dump_requireString(json, "force_class");
++    forceMethod = r0dump_requireString(json, "force_method");
++    forceMethodDescriptor = r0dump_requireString(json, "force_method_descriptor");
++    forceMaxCalls = r0dump_requireUnsignedInt(json, "force_max_calls");
++    anrProtectionEnabled = r0dump_requireBoolean(json, "anr_protection_enabled");
++    r0dump_validate();
++  }
++
++  static r0dump_FusionConfig r0dump_configureForApp(
++      Context appContext, String packageName, String processName) {
++    if (!r0dump_isSystemUserUid(Process.myUid())) {
++      return null;
++    }
++    final r0dump_FusionConfig config;
++    try {
++      config = r0dump_readPersisted(SYSTEM_PROPERTIES);
++    } catch (RuntimeException e) {
++      Slog.w(TAG, "Unable to read process configuration", e);
++      return null;
++    }
++    if (config == null) {
++      return null;
++    }
++    if (!config.enabled || !config.r0dump_matchesProcess(packageName, processName)) {
++      return null;
++    }
++
++    final String outputParent = r0dump_getOutputParent(appContext);
++    if (outputParent == null) {
++      Slog.w(TAG, "Application external files directory is unavailable");
++      return null;
++    }
++    try (ParcelFileDescriptor deliveryChannel =
++        ActivityManager.getService()
++            .r0dump_prepareOutput(
++                packageName, processName, config.runId, config.persistedGeneration)) {
++      if (deliveryChannel == null) {
++        Slog.w(TAG, "Output directory preparation was rejected");
++        return null;
++      }
++      try (ParcelFileDescriptor preparedDirectory =
++          r0dump_receivePreparedDirectory(deliveryChannel)) {
++        if (!r0dump_publishIfEnabled(
++            config,
++            packageName,
++            processName,
++            outputParent,
++            preparedDirectory.getFd(),
++            r0dump_FusionConfig::r0dump_publishNative)) {
++          Slog.w(TAG, "Native process configuration was rejected");
++          return null;
++        }
++      }
++    } catch (IOException | RemoteException e) {
++      Slog.w(TAG, "Unable to prepare the output directory", e);
++      return null;
++    }
++    return config;
++  }
++
++  private static ParcelFileDescriptor r0dump_receivePreparedDirectory(
++      ParcelFileDescriptor deliveryChannel) throws IOException {
++    final LocalSocket socket = new LocalSocket(deliveryChannel.getFileDescriptor());
++    if (socket.getInputStream().read() != 1) {
++      throw new IOException("invalid directory delivery response");
++    }
++    final FileDescriptor[] received = socket.getAncillaryFileDescriptors();
++    try {
++      if (received == null || received.length != 1) {
++        throw new IOException("invalid directory descriptor count");
++      }
++      return ParcelFileDescriptor.dup(received[0]);
++    } finally {
++      if (received != null) {
++        for (FileDescriptor descriptor : received) {
++          try {
++            android.system.Os.close(descriptor);
++          } catch (android.system.ErrnoException ignored) {
++          }
++        }
++      }
++    }
++  }
++
++  static r0dump_FusionConfig r0dump_readPersisted(r0dump_PropertyAccess properties) {
++    final long generationBefore = r0dump_readGeneration(properties);
++    if ((generationBefore & 1L) != 0L) {
++      throw r0dump_invalid("generation_in_progress");
++    }
++    final boolean enabled =
++        r0dump_parsePropertyBoolean(properties.r0dump_get(PROPERTY_PREFIX + "enabled", "0"));
++    if (!enabled) {
++      if (generationBefore != r0dump_readGeneration(properties)) {
++        throw r0dump_invalid("generation_changed");
++      }
++      return null;
++    }
++
++    final JSONObject json = new JSONObject();
++    try {
++      json.put("schema", r0dump_readPropertyLong(properties, "schema", "1"));
++      json.put("enabled", true);
++      json.put("run_id", properties.r0dump_get(PROPERTY_PREFIX + "run_id", ""));
++      json.put("target_package", properties.r0dump_get(PROPERTY_PREFIX + "target_package", ""));
++      json.put("target_process", properties.r0dump_get(PROPERTY_PREFIX + "target_process", ""));
++      json.put(
++          "capture_point_mask",
++          properties.r0dump_get(PROPERTY_PREFIX + "capture_point_mask", "0x0000020000000028"));
++      json.put("max_records", r0dump_readPropertyLong(properties, "max_records", "512"));
++      json.put("max_artifacts", r0dump_readPropertyLong(properties, "max_artifacts", "128"));
++      json.put(
++          "max_total_bytes", r0dump_readPropertyLong(properties, "max_total_bytes", "1073741824"));
++      json.put("max_dex_bytes", r0dump_readPropertyLong(properties, "max_dex_bytes", "268435456"));
++      json.put(
++          "buffer_pool_bytes",
++          r0dump_readPropertyLong(properties, "buffer_pool_bytes", "536870912"));
++      json.put(
++          "max_code_item_bytes",
++          r0dump_readPropertyLong(properties, "max_code_item_bytes", "4194304"));
++      json.put(
++          "max_frozen_generations",
++          r0dump_readPropertyLong(properties, "max_frozen_generations", "4"));
++      json.put("flush_idle_ms", r0dump_readPropertyLong(properties, "flush_idle_ms", "500"));
++      json.put("manifest_enabled", r0dump_readPropertyBoolean(properties, "manifest_enabled", "1"));
++      json.put(
++          "manifest_include_splits",
++          r0dump_readPropertyBoolean(properties, "manifest_include_splits", "1"));
++      json.put(
++          "manifest_max_components",
++          r0dump_readPropertyLong(properties, "manifest_max_components", "8192"));
++      json.put(
++          "manifest_max_splits", r0dump_readPropertyLong(properties, "manifest_max_splits", "32"));
++      json.put(
++          "manifest_max_events_per_source",
++          r0dump_readPropertyLong(properties, "manifest_max_events_per_source", "16384"));
++      json.put(
++          "manifest_max_total_events",
++          r0dump_readPropertyLong(properties, "manifest_max_total_events", "65536"));
++      json.put(
++          "manifest_max_xml_depth",
++          r0dump_readPropertyLong(properties, "manifest_max_xml_depth", "64"));
++      json.put(
++          "manifest_max_attribute_length",
++          r0dump_readPropertyLong(properties, "manifest_max_attribute_length", "1024"));
++      json.put("walk_enabled", r0dump_readPropertyBoolean(properties, "walk_enabled", "1"));
++      json.put(
++          "walk_start",
++          properties.r0dump_get(PROPERTY_PREFIX + "walk_start", "after_application_on_create"));
++      json.put("walk_mode", properties.r0dump_get(PROPERTY_PREFIX + "walk_mode", "loaded_only"));
++      json.put(
++          "walk_namespace_prefix",
++          properties.r0dump_get(PROPERTY_PREFIX + "walk_namespace_prefix", ""));
++      json.put("walk_delay_ms", r0dump_readPropertyLong(properties, "walk_delay_ms", "5000"));
++      json.put(
++          "walk_max_classes", r0dump_readPropertyLong(properties, "walk_max_classes", "16384"));
++      json.put(
++          "walk_max_methods", r0dump_readPropertyLong(properties, "walk_max_methods", "65536"));
++      json.put(
++          "force_invoke_enabled",
++          r0dump_readPropertyBoolean(properties, "force_invoke_enabled", "1"));
++      json.put("force_class", properties.r0dump_get(PROPERTY_PREFIX + "force_class", ""));
++      json.put("force_method", properties.r0dump_get(PROPERTY_PREFIX + "force_method", ""));
++      json.put(
++          "force_method_descriptor",
++          properties.r0dump_get(PROPERTY_PREFIX + "force_method_descriptor", ""));
++      json.put("force_max_calls", r0dump_readPropertyLong(properties, "force_max_calls", "1"));
++      json.put(
++          "anr_protection_enabled",
++          r0dump_readPropertyBoolean(properties, "anr_protection_enabled", "1"));
++    } catch (JSONException e) {
++      throw r0dump_invalid("properties");
++    }
++    if (generationBefore != r0dump_readGeneration(properties)) {
++      throw r0dump_invalid("generation_changed");
++    }
++    final r0dump_FusionConfig config = r0dump_parse(json.toString());
++    config.persistedGeneration = generationBefore;
++    return config;
++  }
++
++  /**
++   * Revalidates a target process output-preparation request against one stable property snapshot.
++   * This is called only by system_server after it has independently verified Binder identity.
++   *
++   * @hide
++   */
++  public static boolean r0dump_validateOutputPreparationForSystemServer(
++      long expectedGeneration,
++      int targetUid,
++      String packageName,
++      String processName,
++      String runId) {
++    return r0dump_validateOutputPreparationForSystemServer(
++        expectedGeneration, targetUid, packageName, processName, runId, SYSTEM_PROPERTIES);
++  }
++
++  static boolean r0dump_validateOutputPreparationForSystemServer(
++      long expectedGeneration,
++      int targetUid,
++      String packageName,
++      String processName,
++      String runId,
++      r0dump_PropertyAccess properties) {
++    if (expectedGeneration < 0L
++        || (expectedGeneration & 1L) != 0L
++        || !r0dump_isSystemUserUid(targetUid)
++        || packageName == null
++        || processName == null
++        || runId == null) {
++      return false;
++    }
++    try {
++      final r0dump_FusionConfig config = r0dump_readPersisted(properties);
++      return config != null
++          && config.persistedGeneration == expectedGeneration
++          && config.enabled
++          && config.runId.equals(runId)
++          && config.r0dump_matchesProcess(packageName, processName);
++    } catch (RuntimeException e) {
++      return false;
++    }
++  }
++
++  static boolean r0dump_writePersisted(
++      r0dump_FusionConfig config, r0dump_PropertyAccess properties) {
++    final long generation = r0dump_readGeneration(properties);
++    if ((generation & 1L) != 0L || generation > Long.MAX_VALUE - 2L) {
++      return false;
++    }
++    final long publishingGeneration = generation + 1L;
++    try {
++      properties.r0dump_set(PROPERTY_GENERATION, Long.toString(publishingGeneration));
++      for (String field : FIELDS) {
++        properties.r0dump_set(PROPERTY_PREFIX + field, config.r0dump_propertyValue(field));
++      }
++      properties.r0dump_set(PROPERTY_GENERATION, Long.toString(publishingGeneration + 1L));
++      return true;
++    } catch (RuntimeException e) {
++      return false;
++    }
++  }
++
++  static boolean r0dump_writePersisted(r0dump_FusionConfig config) {
++    return r0dump_writePersisted(config, SYSTEM_PROPERTIES);
++  }
++
++  /**
++   * Validates and atomically publishes a complete configuration for the system r0dump manager.
++   *
++   * @hide
++   */
++  public static long r0dump_writePersistedForManager(String rawConfig, long expectedGeneration) {
++    return r0dump_writePersistedForManager(rawConfig, expectedGeneration, SYSTEM_PROPERTIES);
++  }
++
++  /**
++   * Atomically disables the persisted configuration for the system r0dump manager.
++   *
++   * @hide
++   */
++  public static long r0dump_disablePersistedForManager(long expectedGeneration) {
++    return r0dump_disablePersistedForManager(expectedGeneration, SYSTEM_PROPERTIES);
++  }
++
++  /**
++   * Recovers an interrupted publication by committing a disabled snapshot.
++   *
++   * @hide
++   */
++  public static long r0dump_recoverDisabledPersistedForManager() {
++    return r0dump_recoverDisabledPersistedForManager(SYSTEM_PROPERTIES);
++  }
++
++  static long r0dump_writePersistedForManager(
++      String rawConfig, long expectedGeneration, r0dump_PropertyAccess properties) {
++    final r0dump_FusionConfig config = r0dump_parse(rawConfig);
++    final long generation = r0dump_requireExpectedStableGeneration(properties, expectedGeneration);
++    r0dump_publishCompleteOrThrow(config, generation, properties);
++    return generation + 2L;
++  }
++
++  static long r0dump_disablePersistedForManager(
++      long expectedGeneration, r0dump_PropertyAccess properties) {
++    final long generation = r0dump_requireExpectedStableGeneration(properties, expectedGeneration);
++    r0dump_publishDisabledOrThrow(generation, properties);
++    return generation + 2L;
++  }
++
++  static long r0dump_recoverDisabledPersistedForManager(r0dump_PropertyAccess properties) {
++    final long generation = r0dump_readGeneration(properties);
++    if ((generation & 1L) == 0L) {
++      throw r0dump_state("generation_not_in_progress");
++    }
++    if (generation == Long.MAX_VALUE) {
++      throw r0dump_state("generation_exhausted");
++    }
++    try {
++      properties.r0dump_set(PROPERTY_PREFIX + "enabled", "0");
++      properties.r0dump_set(PROPERTY_GENERATION, Long.toString(generation + 1L));
++    } catch (RuntimeException e) {
++      throw r0dump_state("property_write_failed");
++    }
++    r0dump_verifyDisabledOrThrow(generation + 1L, properties);
++    return generation + 1L;
++  }
++
++  /** Returns whether the current persisted snapshot protects this exact target from ANR kill. */
++  public static boolean r0dump_shouldProtectAnr(
++      int targetUid, String packageName, String processName) {
++    if (!r0dump_isSystemUserUid(targetUid)) {
++      return false;
++    }
++    try {
++      return r0dump_shouldProtectAnr(
++          r0dump_readPersisted(SYSTEM_PROPERTIES), targetUid, packageName, processName);
++    } catch (RuntimeException e) {
++      Slog.w(TAG, "Unable to read ANR protection configuration");
++      return false;
++    }
++  }
++
++  static boolean r0dump_shouldProtectAnr(
++      r0dump_FusionConfig config, int targetUid, String packageName, String processName) {
++    return config != null
++        && config.enabled
++        && config.anrProtectionEnabled
++        && r0dump_isSystemUserUid(targetUid)
++        && config.r0dump_matchesProcess(packageName, processName);
++  }
++
++  private static long r0dump_requireExpectedStableGeneration(
++      r0dump_PropertyAccess properties, long expectedGeneration) {
++    if (expectedGeneration < 0L || (expectedGeneration & 1L) != 0L) {
++      throw r0dump_state("expected_generation");
++    }
++    final long generation = r0dump_readGeneration(properties);
++    if ((generation & 1L) != 0L) {
++      throw r0dump_state("generation_in_progress");
++    }
++    if (generation != expectedGeneration) {
++      throw r0dump_state("generation_conflict");
++    }
++    if (generation > Long.MAX_VALUE - 2L) {
++      throw r0dump_state("generation_exhausted");
++    }
++    return generation;
++  }
++
++  private static void r0dump_publishCompleteOrThrow(
++      r0dump_FusionConfig config, long generation, r0dump_PropertyAccess properties) {
++    final long publishingGeneration = generation + 1L;
++    try {
++      properties.r0dump_set(PROPERTY_GENERATION, Long.toString(publishingGeneration));
++      for (String field : FIELDS) {
++        properties.r0dump_set(PROPERTY_PREFIX + field, config.r0dump_propertyValue(field));
++      }
++      properties.r0dump_set(PROPERTY_GENERATION, Long.toString(publishingGeneration + 1L));
++    } catch (RuntimeException e) {
++      throw r0dump_state("property_write_failed");
++    }
++    r0dump_verifyCompleteOrThrow(config, publishingGeneration + 1L, properties);
++  }
++
++  private static void r0dump_publishDisabledOrThrow(
++      long generation, r0dump_PropertyAccess properties) {
++    final long publishingGeneration = generation + 1L;
++    try {
++      properties.r0dump_set(PROPERTY_GENERATION, Long.toString(publishingGeneration));
++      properties.r0dump_set(PROPERTY_PREFIX + "enabled", "0");
++      properties.r0dump_set(PROPERTY_GENERATION, Long.toString(publishingGeneration + 1L));
++    } catch (RuntimeException e) {
++      throw r0dump_state("property_write_failed");
++    }
++    r0dump_verifyDisabledOrThrow(publishingGeneration + 1L, properties);
++  }
++
++  private static void r0dump_verifyCompleteOrThrow(
++      r0dump_FusionConfig config, long expectedGeneration, r0dump_PropertyAccess properties) {
++    if (r0dump_readGeneration(properties) != expectedGeneration) {
++      throw r0dump_state("property_verification_failed");
++    }
++    for (String field : FIELDS) {
++      if (!config
++          .r0dump_propertyValue(field)
++          .equals(properties.r0dump_get(PROPERTY_PREFIX + field, ""))) {
++        throw r0dump_state("property_verification_failed");
++      }
++    }
++    if (r0dump_readGeneration(properties) != expectedGeneration) {
++      throw r0dump_state("property_verification_failed");
++    }
++  }
++
++  private static void r0dump_verifyDisabledOrThrow(
++      long expectedGeneration, r0dump_PropertyAccess properties) {
++    if (r0dump_readGeneration(properties) != expectedGeneration
++        || !"0".equals(properties.r0dump_get(PROPERTY_PREFIX + "enabled", ""))
++        || r0dump_readGeneration(properties) != expectedGeneration) {
++      throw r0dump_state("property_verification_failed");
++    }
++  }
++
++  private static long r0dump_readGeneration(r0dump_PropertyAccess properties) {
++    final String value = properties.r0dump_get(PROPERTY_GENERATION, "0");
++    try {
++      final long generation = Long.parseLong(value);
++      if (generation < 0L) {
++        throw r0dump_invalid("generation");
++      }
++      return generation;
++    } catch (NumberFormatException e) {
++      throw r0dump_invalid("generation");
++    }
++  }
++
++  private static long r0dump_readPropertyLong(
++      r0dump_PropertyAccess properties, String field, String defaultValue) {
++    final String value = properties.r0dump_get(PROPERTY_PREFIX + field, defaultValue);
++    try {
++      return Long.parseLong(value);
++    } catch (NumberFormatException e) {
++      throw r0dump_invalid(field);
++    }
++  }
++
++  private static boolean r0dump_readPropertyBoolean(
++      r0dump_PropertyAccess properties, String field, String defaultValue) {
++    return r0dump_parsePropertyBoolean(
++        properties.r0dump_get(PROPERTY_PREFIX + field, defaultValue));
++  }
++
++  private static boolean r0dump_parsePropertyBoolean(String value) {
++    if ("1".equals(value)) {
++      return true;
++    }
++    if ("0".equals(value)) {
++      return false;
++    }
++    throw r0dump_invalid("boolean");
++  }
++
++  static r0dump_FusionConfig r0dump_parse(String rawConfig) {
++    if (rawConfig == null
++        || rawConfig.length() > MAX_JSON_BYTES
++        || rawConfig.getBytes(StandardCharsets.UTF_8).length > MAX_JSON_BYTES) {
++      throw r0dump_invalid("json_size");
++    }
++    try {
++      r0dump_validateStrictJson(rawConfig);
++      final JSONObject json = new JSONObject(rawConfig);
++      r0dump_validateFields(json);
++      return new r0dump_FusionConfig(json);
++    } catch (IOException | JSONException | IllegalStateException e) {
++      throw r0dump_invalid("json_syntax");
++    }
++  }
++
++  static boolean r0dump_publishIfEnabled(
++      String rawConfig,
++      String packageName,
++      String processName,
++      String outputParent,
++      r0dump_Publisher publisher) {
++    return r0dump_publishIfEnabled(
++        r0dump_parse(rawConfig), packageName, processName, outputParent, -1, publisher);
++  }
++
++  private static boolean r0dump_publishIfEnabled(
++      r0dump_FusionConfig config,
++      String packageName,
++      String processName,
++      String outputParent,
++      int preparedDirectoryFd,
++      r0dump_Publisher publisher) {
++    if (packageName == null
++        || processName == null
++        || !config.enabled
++        || !config.r0dump_matchesProcess(packageName, processName)) {
++      return false;
++    }
++    if (!r0dump_isTrustedOutputParent(outputParent, packageName)) {
++      throw r0dump_invalid("output_parent");
++    }
++    return publisher.r0dump_publish(config, processName, outputParent, preparedDirectoryFd);
++  }
++
++  private static boolean r0dump_publishNative(
++      r0dump_FusionConfig config,
++      String processName,
++      String outputParent,
++      int preparedDirectoryFd) {
++    return r0dump_Runtime.r0dump_configure(
++        config.schema,
++        config.enabled,
++        config.runId,
++        config.targetPackage,
++        config.targetProcess,
++        processName,
++        outputParent,
++        preparedDirectoryFd,
++        config.capturePointMask,
++        config.maxRecords,
++        config.maxArtifacts,
++        config.maxTotalBytes,
++        config.maxDexBytes,
++        config.bufferPoolBytes,
++        config.maxCodeItemBytes,
++        config.maxFrozenGenerations,
++        config.flushIdleMs,
++        config.manifestEnabled,
++        config.manifestIncludeSplits,
++        config.manifestMaxComponents,
++        config.manifestMaxSplits,
++        config.manifestMaxEventsPerSource,
++        config.manifestMaxTotalEvents,
++        config.manifestMaxXmlDepth,
++        config.manifestMaxAttributeLength,
++        config.walkEnabled,
++        config.walkStart,
++        config.walkMode,
++        config.walkNamespacePrefix,
++        config.walkDelayMs,
++        config.walkMaxClasses,
++        config.walkMaxMethods,
++        config.forceInvokeEnabled,
++        config.forceClass,
++        config.forceMethod,
++        config.forceMethodDescriptor,
++        config.forceMaxCalls);
++  }
++
++  private boolean r0dump_matchesProcess(String packageName, String processName) {
++    return targetPackage.equals(packageName)
++        && (targetProcess.isEmpty() || targetProcess.equals(processName));
++  }
++
++  private void r0dump_validate() {
++    if (schema != 1) {
++      throw r0dump_invalid("schema");
++    }
++    if (!r0dump_isRunId(runId)) {
++      throw r0dump_invalid("run_id");
++    }
++    if (!r0dump_isPackageName(targetPackage)) {
++      throw r0dump_invalid("target_package");
++    }
++    if (!r0dump_isTargetProcess(targetPackage, targetProcess)) {
++      throw r0dump_invalid("target_process");
++    }
++    if (!walkNamespacePrefix.isEmpty() && !r0dump_isNamespacePrefix(walkNamespacePrefix)) {
++      throw r0dump_invalid("walk_namespace_prefix");
++    }
++    if (!r0dump_fitsPropertyValue(runId)
++        || !r0dump_fitsPropertyValue(targetPackage)
++        || !r0dump_fitsPropertyValue(targetProcess)
++        || !r0dump_fitsPropertyValue(walkNamespacePrefix)
++        || !r0dump_fitsPropertyValue(forceClass)
++        || !r0dump_fitsPropertyValue(forceMethod)
++        || !r0dump_fitsPropertyValue(forceMethodDescriptor)) {
++      throw r0dump_invalid("property_value_length");
++    }
++    if ((capturePointMask & ~DEFINED_CAPTURE_POINT_MASK) != 0) {
++      throw r0dump_invalid("capture_point_mask");
++    }
++    if (maxRecords == 0
++        || maxRecords > 4096
++        || maxArtifacts == 0
++        || maxArtifacts > 512
++        || maxArtifacts > maxRecords
++        || maxTotalBytes > 1024L * 1024 * 1024
++        || maxDexBytes > 256L * 1024 * 1024
++        || maxDexBytes > maxTotalBytes
++        || bufferPoolBytes < maxDexBytes
++        || bufferPoolBytes > 512L * 1024 * 1024
++        || maxCodeItemBytes == 0
++        || maxCodeItemBytes > 4L * 1024 * 1024
++        || maxCodeItemBytes > bufferPoolBytes
++        || maxFrozenGenerations == 0
++        || maxFrozenGenerations > 4
++        || flushIdleMs == 0
++        || flushIdleMs > 60000) {
++      throw r0dump_invalid("budgets");
++    }
++    if (manifestMaxComponents == 0 || manifestMaxComponents > 16384) {
++      throw r0dump_invalid("manifest_max_components");
++    }
++    if (manifestMaxSplits > 32
++        || manifestMaxEventsPerSource == 0
++        || manifestMaxEventsPerSource > 262144
++        || manifestMaxTotalEvents < manifestMaxEventsPerSource
++        || manifestMaxTotalEvents > 1048576
++        || manifestMaxXmlDepth == 0
++        || manifestMaxXmlDepth > 256
++        || manifestMaxAttributeLength == 0
++        || manifestMaxAttributeLength > 4096) {
++      throw r0dump_invalid("manifest_limits");
++    }
++    if (walkMaxClasses == 0
++        || walkMaxClasses > 1000000
++        || walkMaxMethods == 0
++        || walkMaxMethods > 10000000) {
++      throw r0dump_invalid("walk_limits");
++    }
++    if (forceMaxCalls == 0 || forceMaxCalls > 10000000) {
++      throw r0dump_invalid("force_max_calls");
++    }
++    if (forceInvokeEnabled) {
++      final boolean selectorEmpty =
++          forceClass.isEmpty() && forceMethod.isEmpty() && forceMethodDescriptor.isEmpty();
++      if ((capturePointMask & FORCE_INVOKE_NO_EXECUTE_BIT) == 0
++          || (selectorEmpty && !manifestEnabled)
++          || (!selectorEmpty
++              && (!r0dump_isBinaryClassName(forceClass)
++                  || !r0dump_isMethodName(forceMethod)
++                  || !r0dump_isMethodDescriptor(forceMethodDescriptor)))) {
++        throw r0dump_invalid("force_selector");
++      }
++    }
++  }
++
++  private static void r0dump_validateStrictJson(String rawConfig) throws IOException {
++    final Set<String> names = new HashSet<>();
++    try (JsonReader reader = new JsonReader(new StringReader(rawConfig))) {
++      reader.beginObject();
++      while (reader.hasNext()) {
++        final String name = reader.nextName();
++        if (!names.add(name)) {
++          throw r0dump_invalid("duplicate_field");
++        }
++        reader.skipValue();
++      }
++      reader.endObject();
++      if (reader.peek() != JsonToken.END_DOCUMENT) {
++        throw r0dump_invalid("json_syntax");
++      }
++    }
++  }
++
++  private static void r0dump_validateFields(JSONObject json) {
++    if (json.length() != FIELDS.size()) {
++      throw r0dump_invalid("fields");
++    }
++    final Iterator<String> keys = json.keys();
++    while (keys.hasNext()) {
++      if (!FIELDS.contains(keys.next())) {
++        throw r0dump_invalid("unknown_field");
++      }
++    }
++    for (String field : FIELDS) {
++      if (!json.has(field)) {
++        throw r0dump_invalid("missing_field");
++      }
++    }
++  }
++
++  private static int r0dump_requireInt(JSONObject json, String field) throws JSONException {
++    final long value = r0dump_requireLong(json, field);
++    if (value < Integer.MIN_VALUE || value > Integer.MAX_VALUE) {
++      throw r0dump_invalid(field);
++    }
++    return (int) value;
++  }
++
++  private static long r0dump_requireUnsignedInt(JSONObject json, String field)
++      throws JSONException {
++    final long value = r0dump_requireLong(json, field);
++    if (value < 0 || value > MAX_UNSIGNED_INT) {
++      throw r0dump_invalid(field);
++    }
++    return value;
++  }
++
++  private static long r0dump_requirePositiveLong(JSONObject json, String field)
++      throws JSONException {
++    final long value = r0dump_requireLong(json, field);
++    if (value <= 0) {
++      throw r0dump_invalid(field);
++    }
++    return value;
++  }
++
++  private static long r0dump_requireLong(JSONObject json, String field) throws JSONException {
++    final Object value = json.get(field);
++    if (!(value instanceof Integer) && !(value instanceof Long)) {
++      throw r0dump_invalid(field);
++    }
++    return ((Number) value).longValue();
++  }
++
++  private static boolean r0dump_requireBoolean(JSONObject json, String field) throws JSONException {
++    final Object value = json.get(field);
++    if (!(value instanceof Boolean)) {
++      throw r0dump_invalid(field);
++    }
++    return (Boolean) value;
++  }
++
++  private static String r0dump_requireString(JSONObject json, String field) throws JSONException {
++    final Object value = json.get(field);
++    if (!(value instanceof String)) {
++      throw r0dump_invalid(field);
++    }
++    return (String) value;
++  }
++
++  private static long r0dump_parseMask(String value) {
++    if (value.length() != 18 || !value.startsWith("0x")) {
++      throw r0dump_invalid("capture_point_mask");
++    }
++    for (int i = 2; i < value.length(); i++) {
++      final char ch = value.charAt(i);
++      if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F'))) {
++        throw r0dump_invalid("capture_point_mask");
++      }
++    }
++    try {
++      return Long.parseUnsignedLong(value.substring(2), 16);
++    } catch (NumberFormatException e) {
++      throw r0dump_invalid("capture_point_mask");
++    }
++  }
++
++  private static int r0dump_parseWalkStart(String value) {
++    switch (value) {
++      case "after_application_on_create":
++        return WALK_START_AFTER_APPLICATION_ON_CREATE;
++      case "after_first_activity_on_create":
++        return WALK_START_AFTER_FIRST_ACTIVITY_ON_CREATE;
++      default:
++        throw r0dump_invalid("walk_start");
++    }
++  }
++
++  private static int r0dump_parseWalkMode(String value) {
++    switch (value) {
++      case "loaded_only":
++        return WALK_MODE_LOADED_ONLY;
++      case "dex_names":
++        return WALK_MODE_DEX_NAMES;
++      default:
++        throw r0dump_invalid("walk_mode");
++    }
++  }
++
++  private static boolean r0dump_isRunId(String value) {
++    if (value.isEmpty() || value.length() > 64 || !r0dump_isAsciiAlphaNumeric(value.charAt(0))) {
++      return false;
++    }
++    for (int i = 1; i < value.length(); i++) {
++      final char ch = value.charAt(i);
++      if (!r0dump_isAsciiAlphaNumeric(ch) && ch != '-' && ch != '_' && ch != '.') {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  private static boolean r0dump_fitsPropertyValue(String value) {
++    return value.getBytes(StandardCharsets.UTF_8).length <= SystemProperties.PROP_VALUE_MAX;
++  }
++
++  private static boolean r0dump_isPackageName(String value) {
++    if (value.isEmpty() || value.length() > 255 || value.startsWith(".") || value.endsWith(".")) {
++      return false;
++    }
++    for (String segment : value.split("\\.", -1)) {
++      if (!r0dump_isJavaIdentifierSegment(segment, false)) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  private static boolean r0dump_isTargetProcess(String packageName, String processName) {
++    if (processName.isEmpty() || processName.equals(packageName)) {
++      return true;
++    }
++    if (!processName.startsWith(packageName + ":")) {
++      return false;
++    }
++    for (String segment : processName.substring(packageName.length() + 1).split("\\.", -1)) {
++      if (!r0dump_isJavaIdentifierSegment(segment, false)) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  private static boolean r0dump_isBinaryClassName(String value) {
++    if (value.isEmpty() || value.length() > 1024 || value.indexOf('/') >= 0) {
++      return false;
++    }
++    for (String segment : value.split("\\.", -1)) {
++      if (!r0dump_isJavaIdentifierSegment(segment, true)) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  private static boolean r0dump_isNamespacePrefix(String value) {
++    if (value.isEmpty() || value.length() > 91 || !value.endsWith(".")) {
++      return false;
++    }
++    final String body = value.substring(0, value.length() - 1);
++    for (String segment : body.split("\\.", -1)) {
++      if (!r0dump_isJavaIdentifierSegment(segment, true)) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  private static boolean r0dump_isMethodName(String value) {
++    return "<init>".equals(value)
++        || "<clinit>".equals(value)
++        || (value.length() <= 255 && r0dump_isJavaIdentifierSegment(value, false));
++  }
++
++  private static boolean r0dump_isMethodDescriptor(String descriptor) {
++    if (descriptor.length() < 3 || descriptor.length() > 1024 || descriptor.charAt(0) != '(') {
++      return false;
++    }
++    int cursor = 1;
++    while (cursor < descriptor.length() && descriptor.charAt(cursor) != ')') {
++      final int next = r0dump_consumeDescriptorType(descriptor, cursor, false);
++      if (next <= cursor) {
++        return false;
++      }
++      cursor = next;
++    }
++    if (cursor >= descriptor.length() || descriptor.charAt(cursor) != ')') {
++      return false;
++    }
++    return r0dump_consumeDescriptorType(descriptor, cursor + 1, true) == descriptor.length();
++  }
++
++  private static int r0dump_consumeDescriptorType(
++      String descriptor, int cursor, boolean allowVoid) {
++    final int start = cursor;
++    while (cursor < descriptor.length() && descriptor.charAt(cursor) == '[') {
++      cursor++;
++    }
++    if (cursor >= descriptor.length()) {
++      return -1;
++    }
++    final boolean isArray = cursor != start;
++    final char kind = descriptor.charAt(cursor++);
++    if (kind == 'V') {
++      return allowVoid && !isArray ? cursor : -1;
++    }
++    if ("BCDFIJSZ".indexOf(kind) >= 0) {
++      return cursor;
++    }
++    if (kind != 'L') {
++      return -1;
++    }
++    final int end = descriptor.indexOf(';', cursor);
++    if (end < cursor || end < 0) {
++      return -1;
++    }
++    final String className = descriptor.substring(cursor, end);
++    if (className.indexOf('.') >= 0) {
++      return -1;
++    }
++    for (String segment : className.split("/", -1)) {
++      if (!r0dump_isJavaIdentifierSegment(segment, true)) {
++        return -1;
++      }
++    }
++    return end + 1;
++  }
++
++  private static boolean r0dump_isJavaIdentifierSegment(String value, boolean allowDollar) {
++    if (value.isEmpty() || !r0dump_isIdentifierStart(value.charAt(0), allowDollar)) {
++      return false;
++    }
++    for (int i = 1; i < value.length(); i++) {
++      final char ch = value.charAt(i);
++      if (!r0dump_isAsciiAlphaNumeric(ch) && ch != '_' && (!allowDollar || ch != '$')) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  private static boolean r0dump_isIdentifierStart(char ch, boolean allowDollar) {
++    return r0dump_isAsciiAlpha(ch) || ch == '_' || (allowDollar && ch == '$');
++  }
++
++  private static boolean r0dump_isAsciiAlphaNumeric(char ch) {
++    return r0dump_isAsciiAlpha(ch) || (ch >= '0' && ch <= '9');
++  }
++
++  private static boolean r0dump_isAsciiAlpha(char ch) {
++    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
++  }
++
++  static String r0dump_getOutputParent(Context appContext) {
++    try {
++      final File directory = appContext.getExternalFilesDir(null);
++      return directory == null ? null : directory.getAbsolutePath();
++    } catch (RuntimeException e) {
++      return null;
++    }
++  }
++
++  private static boolean r0dump_isTrustedOutputParent(String outputParent, String packageName) {
++    final int userId = UserHandle.getUserId(Process.myUid());
++    return ("/storage/emulated/" + userId + "/Android/data/" + packageName + "/files")
++        .equals(outputParent);
++  }
++
++  static boolean r0dump_isSystemUserUid(int uid) {
++    return UserHandle.getUserId(uid) == UserHandle.USER_SYSTEM;
++  }
++
++  private String r0dump_propertyValue(String field) {
++    switch (field) {
++      case "schema":
++        return Integer.toString(schema);
++      case "enabled":
++        return enabled ? "1" : "0";
++      case "run_id":
++        return runId;
++      case "target_package":
++        return targetPackage;
++      case "target_process":
++        return targetProcess;
++      case "capture_point_mask":
++        return String.format(Locale.ROOT, "0x%016x", capturePointMask);
++      case "max_records":
++        return Long.toString(maxRecords);
++      case "max_artifacts":
++        return Long.toString(maxArtifacts);
++      case "max_total_bytes":
++        return Long.toString(maxTotalBytes);
++      case "max_dex_bytes":
++        return Long.toString(maxDexBytes);
++      case "buffer_pool_bytes":
++        return Long.toString(bufferPoolBytes);
++      case "max_code_item_bytes":
++        return Long.toString(maxCodeItemBytes);
++      case "max_frozen_generations":
++        return Long.toString(maxFrozenGenerations);
++      case "flush_idle_ms":
++        return Long.toString(flushIdleMs);
++      case "manifest_enabled":
++        return manifestEnabled ? "1" : "0";
++      case "manifest_include_splits":
++        return manifestIncludeSplits ? "1" : "0";
++      case "manifest_max_components":
++        return Long.toString(manifestMaxComponents);
++      case "manifest_max_splits":
++        return Long.toString(manifestMaxSplits);
++      case "manifest_max_events_per_source":
++        return Long.toString(manifestMaxEventsPerSource);
++      case "manifest_max_total_events":
++        return Long.toString(manifestMaxTotalEvents);
++      case "manifest_max_xml_depth":
++        return Long.toString(manifestMaxXmlDepth);
++      case "manifest_max_attribute_length":
++        return Long.toString(manifestMaxAttributeLength);
++      case "walk_enabled":
++        return walkEnabled ? "1" : "0";
++      case "walk_start":
++        return walkStart == WALK_START_AFTER_APPLICATION_ON_CREATE
++            ? "after_application_on_create"
++            : "after_first_activity_on_create";
++      case "walk_mode":
++        return walkMode == WALK_MODE_LOADED_ONLY ? "loaded_only" : "dex_names";
++      case "walk_namespace_prefix":
++        return walkNamespacePrefix;
++      case "walk_delay_ms":
++        return Long.toString(walkDelayMs);
++      case "walk_max_classes":
++        return Long.toString(walkMaxClasses);
++      case "walk_max_methods":
++        return Long.toString(walkMaxMethods);
++      case "force_invoke_enabled":
++        return forceInvokeEnabled ? "1" : "0";
++      case "force_class":
++        return forceClass;
++      case "force_method":
++        return forceMethod;
++      case "force_method_descriptor":
++        return forceMethodDescriptor;
++      case "force_max_calls":
++        return Long.toString(forceMaxCalls);
++      case "anr_protection_enabled":
++        return anrProtectionEnabled ? "1" : "0";
++      default:
++        throw r0dump_invalid("property_field");
++    }
++  }
++
++  private static IllegalArgumentException r0dump_invalid(String field) {
++    return new IllegalArgumentException(field);
++  }
++
++  private static IllegalStateException r0dump_state(String reason) {
++    return new IllegalStateException(reason);
++  }
++
++  interface r0dump_Publisher {
++    boolean r0dump_publish(
++        r0dump_FusionConfig config,
++        String processName,
++        String outputParent,
++        int preparedDirectoryFd);
++  }
++
++  interface r0dump_PropertyAccess {
++    String r0dump_get(String key, String defaultValue);
++
++    void r0dump_set(String key, String value);
++  }
++}
+diff --git a/core/java/android/app/r0dump_ManifestHelper.java b/core/java/android/app/r0dump_ManifestHelper.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..9bb55351a00aeaf9789584b21cc18e33f931d57d
+--- /dev/null
++++ b/core/java/android/app/r0dump_ManifestHelper.java
+@@ -0,0 +1,678 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.app;
++
++import android.content.pm.ApplicationInfo;
++import android.content.res.AssetManager;
++import android.content.res.XmlResourceParser;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import org.xmlpull.v1.XmlPullParser;
++import org.xmlpull.v1.XmlPullParserException;
++
++/** Parses trusted compiled manifests into class seeds for r0dump's future walk worker. */
++final class r0dump_ManifestHelper {
++  private static final String ANDROID_NAMESPACE = "http://schemas.android.com/apk/res/android";
++  private static final String MANIFEST_FILE = "AndroidManifest.xml";
++
++  static final class r0dump_Limits {
++    final int maxComponents;
++    final int maxSplits;
++    final int maxEventsPerSource;
++    final int maxTotalEvents;
++    final int maxXmlDepth;
++    final int maxAttributeLength;
++
++    r0dump_Limits(
++        int maxComponents,
++        int maxSplits,
++        int maxEventsPerSource,
++        int maxTotalEvents,
++        int maxXmlDepth,
++        int maxAttributeLength) {
++      this.maxComponents = maxComponents;
++      this.maxSplits = maxSplits;
++      this.maxEventsPerSource = maxEventsPerSource;
++      this.maxTotalEvents = maxTotalEvents;
++      this.maxXmlDepth = maxXmlDepth;
++      this.maxAttributeLength = maxAttributeLength;
++    }
++  }
++
++  enum r0dump_Status {
++    OK,
++    DISABLED,
++    NO_BASE_APK,
++    ASSET_COOKIE_MISSING,
++    XML_OPEN_FAILED,
++    MALFORMED_XML,
++    PACKAGE_MISSING,
++    PACKAGE_MISMATCH,
++    LIMIT_EXCEEDED,
++    PARTIAL_SPLIT_FAILURE
++  }
++
++  enum r0dump_SeedKind {
++    APPLICATION,
++    ACTIVITY,
++    ACTIVITY_ALIAS_TARGET,
++    SERVICE,
++    RECEIVER,
++    PROVIDER,
++    INSTRUMENTATION
++  }
++
++  enum r0dump_LimitKind {
++    NONE,
++    SOURCE_COUNT,
++    SOURCE_EVENT_COUNT,
++    TOTAL_EVENT_COUNT,
++    XML_DEPTH,
++    ATTRIBUTE_LENGTH,
++    COMPONENT_COUNT
++  }
++
++  enum r0dump_SourceKind {
++    BASE,
++    SPLIT
++  }
++
++  static final class r0dump_ClassSeed {
++    final String className;
++    final r0dump_SeedKind kind;
++    final int sourceOrdinal;
++
++    r0dump_ClassSeed(String className, r0dump_SeedKind kind, int sourceOrdinal) {
++      this.className = className;
++      this.kind = kind;
++      this.sourceOrdinal = sourceOrdinal;
++    }
++  }
++
++  static final class r0dump_ManifestSource {
++    final int ordinal;
++    final r0dump_SourceKind kind;
++    final r0dump_Status status;
++    final int eventCount;
++    final r0dump_LimitKind limitHit;
++
++    r0dump_ManifestSource(
++        int ordinal,
++        r0dump_SourceKind kind,
++        r0dump_Status status,
++        int eventCount,
++        r0dump_LimitKind limitHit) {
++      this.ordinal = ordinal;
++      this.kind = kind;
++      this.status = status;
++      this.eventCount = eventCount;
++      this.limitHit = limitHit;
++    }
++  }
++
++  static final class r0dump_Snapshot {
++    final r0dump_Status status;
++    final String packageName;
++    final List<r0dump_ClassSeed> seeds;
++    final List<r0dump_ManifestSource> sources;
++    final int sourceCount;
++    final int parsedSourceCount;
++    final int rejectedSourceCount;
++    final int xmlEventCount;
++    final r0dump_LimitKind limitHit;
++
++    r0dump_Snapshot(
++        r0dump_Status status,
++        String packageName,
++        List<r0dump_ClassSeed> seeds,
++        List<r0dump_ManifestSource> sources,
++        int sourceCount,
++        int parsedSourceCount,
++        int rejectedSourceCount,
++        int xmlEventCount,
++        r0dump_LimitKind limitHit) {
++      this.status = status;
++      this.packageName = packageName;
++      this.seeds = Collections.unmodifiableList(new ArrayList<>(seeds));
++      this.sources = Collections.unmodifiableList(new ArrayList<>(sources));
++      this.sourceCount = sourceCount;
++      this.parsedSourceCount = parsedSourceCount;
++      this.rejectedSourceCount = rejectedSourceCount;
++      this.xmlEventCount = xmlEventCount;
++      this.limitHit = limitHit;
++    }
++  }
++
++  static final class r0dump_SourceResult {
++    final r0dump_Status status;
++    final String packageName;
++    final List<r0dump_ClassSeed> seeds;
++    final int eventCount;
++    final r0dump_LimitKind limitHit;
++
++    r0dump_SourceResult(
++        r0dump_Status status, String packageName, List<r0dump_ClassSeed> seeds, int eventCount) {
++      this(status, packageName, seeds, eventCount, r0dump_LimitKind.NONE);
++    }
++
++    r0dump_SourceResult(
++        r0dump_Status status,
++        String packageName,
++        List<r0dump_ClassSeed> seeds,
++        int eventCount,
++        r0dump_LimitKind limitHit) {
++      this.status = status;
++      this.packageName = packageName;
++      this.seeds = seeds;
++      this.eventCount = eventCount;
++      this.limitHit = limitHit;
++    }
++  }
++
++  private static final class r0dump_LimitException extends Exception {
++    final r0dump_LimitKind kind;
++
++    r0dump_LimitException(r0dump_LimitKind kind) {
++      this.kind = kind;
++    }
++  }
++
++  private r0dump_ManifestHelper() {}
++
++  static r0dump_Snapshot r0dump_parse(
++      LoadedApk loadedApk,
++      ApplicationInfo appInfo,
++      String expectedPackage,
++      boolean includeSplits,
++      r0dump_Limits limits) {
++    if (loadedApk == null
++        || appInfo == null
++        || appInfo.sourceDir == null
++        || appInfo.sourceDir.isEmpty()) {
++      return r0dump_snapshot(r0dump_Status.NO_BASE_APK, null, List.of(), 0, 0, 0, 0);
++    }
++    if (limits == null
++        || limits.maxComponents <= 0
++        || limits.maxSplits < 0
++        || limits.maxEventsPerSource <= 0
++        || limits.maxTotalEvents < limits.maxEventsPerSource
++        || limits.maxXmlDepth <= 0
++        || limits.maxAttributeLength <= 0) {
++      return r0dump_snapshot(
++          r0dump_Status.LIMIT_EXCEEDED,
++          null,
++          List.of(),
++          1,
++          0,
++          0,
++          0,
++          r0dump_LimitKind.COMPONENT_COUNT);
++    }
++
++    final ArrayList<String> sourcePaths = new ArrayList<>();
++    sourcePaths.add(appInfo.sourceDir);
++    if (includeSplits && appInfo.splitSourceDirs != null) {
++      if (appInfo.splitSourceDirs.length > limits.maxSplits) {
++        return r0dump_snapshot(
++            r0dump_Status.LIMIT_EXCEEDED,
++            null,
++            List.of(),
++            1,
++            0,
++            1,
++            0,
++            r0dump_LimitKind.SOURCE_COUNT);
++      }
++      for (int i = 0; i < appInfo.splitSourceDirs.length; i++) {
++        sourcePaths.add(appInfo.splitSourceDirs[i]);
++      }
++    }
++
++    final AssetManager assets;
++    try {
++      assets = loadedApk.getAssets();
++    } catch (RuntimeException e) {
++      return r0dump_snapshot(
++          r0dump_Status.XML_OPEN_FAILED, null, List.of(), sourcePaths.size(), 0, 1, 0);
++    }
++
++    final ArrayList<r0dump_ClassSeed> seeds = new ArrayList<>();
++    final ArrayList<r0dump_ManifestSource> sources = new ArrayList<>();
++    String basePackage = null;
++    int parsedSourceCount = 0;
++    int rejectedSourceCount = 0;
++    int totalEventCount = 0;
++    boolean splitFailed = false;
++
++    for (int ordinal = 0; ordinal < sourcePaths.size(); ordinal++) {
++      final String sourcePath = sourcePaths.get(ordinal);
++      final int cookie;
++      try {
++        cookie = sourcePath == null ? 0 : assets.findCookieForPath(sourcePath);
++      } catch (RuntimeException e) {
++        sources.add(r0dump_source(ordinal, r0dump_Status.ASSET_COOKIE_MISSING, 0, null));
++        if (ordinal == 0) {
++          return r0dump_snapshot(
++              r0dump_Status.ASSET_COOKIE_MISSING,
++              null,
++              List.of(),
++              sourcePaths.size(),
++              0,
++              1,
++              totalEventCount,
++              r0dump_LimitKind.NONE,
++              sources);
++        }
++        rejectedSourceCount++;
++        splitFailed = true;
++        continue;
++      }
++      if (cookie <= 0) {
++        sources.add(r0dump_source(ordinal, r0dump_Status.ASSET_COOKIE_MISSING, 0, null));
++        if (ordinal == 0) {
++          return r0dump_snapshot(
++              r0dump_Status.ASSET_COOKIE_MISSING,
++              null,
++              List.of(),
++              sourcePaths.size(),
++              0,
++              1,
++              totalEventCount,
++              r0dump_LimitKind.NONE,
++              sources);
++        }
++        rejectedSourceCount++;
++        splitFailed = true;
++        continue;
++      }
++
++      final r0dump_SourceResult result =
++          r0dump_parseSource(
++              assets,
++              cookie,
++              ordinal,
++              limits,
++              limits.maxComponents - seeds.size(),
++              limits.maxTotalEvents - totalEventCount);
++      totalEventCount += result.eventCount;
++      if (result.status != r0dump_Status.OK) {
++        sources.add(r0dump_source(ordinal, result.status, result.eventCount, result.limitHit));
++        rejectedSourceCount++;
++        if (ordinal == 0 || result.status == r0dump_Status.LIMIT_EXCEEDED) {
++          return r0dump_snapshot(
++              result.status,
++              basePackage,
++              ordinal == 0 ? List.of() : seeds,
++              sourcePaths.size(),
++              parsedSourceCount,
++              rejectedSourceCount,
++              totalEventCount,
++              result.limitHit,
++              sources);
++        }
++        splitFailed = true;
++        continue;
++      }
++
++      if (ordinal == 0) {
++        basePackage = result.packageName;
++        if (basePackage == null || basePackage.isEmpty()) {
++          sources.add(
++              r0dump_source(ordinal, r0dump_Status.PACKAGE_MISSING, result.eventCount, null));
++          return r0dump_snapshot(
++              r0dump_Status.PACKAGE_MISSING,
++              null,
++              List.of(),
++              sourcePaths.size(),
++              0,
++              1,
++              totalEventCount,
++              r0dump_LimitKind.NONE,
++              sources);
++        }
++        if (!basePackage.equals(appInfo.packageName) || !basePackage.equals(expectedPackage)) {
++          sources.add(
++              r0dump_source(ordinal, r0dump_Status.PACKAGE_MISMATCH, result.eventCount, null));
++          return r0dump_snapshot(
++              r0dump_Status.PACKAGE_MISMATCH,
++              basePackage,
++              List.of(),
++              sourcePaths.size(),
++              0,
++              1,
++              totalEventCount,
++              r0dump_LimitKind.NONE,
++              sources);
++        }
++      } else if (!basePackage.equals(result.packageName)) {
++        sources.add(
++            r0dump_source(ordinal, r0dump_Status.PACKAGE_MISMATCH, result.eventCount, null));
++        rejectedSourceCount++;
++        splitFailed = true;
++        continue;
++      }
++
++      seeds.addAll(result.seeds);
++      sources.add(r0dump_source(ordinal, r0dump_Status.OK, result.eventCount, null));
++      parsedSourceCount++;
++    }
++
++    return r0dump_snapshot(
++        splitFailed ? r0dump_Status.PARTIAL_SPLIT_FAILURE : r0dump_Status.OK,
++        basePackage,
++        seeds,
++        sourcePaths.size(),
++        parsedSourceCount,
++        rejectedSourceCount,
++        totalEventCount,
++        r0dump_LimitKind.NONE,
++        sources);
++  }
++
++  private static r0dump_SourceResult r0dump_parseSource(
++      AssetManager assets,
++      int cookie,
++      int sourceOrdinal,
++      r0dump_Limits limits,
++      int remainingComponents,
++      int remainingEvents) {
++    final XmlResourceParser parser;
++    try {
++      parser = assets.openXmlResourceParser(cookie, MANIFEST_FILE);
++    } catch (IOException e) {
++      return new r0dump_SourceResult(
++          r0dump_Status.XML_OPEN_FAILED, null, List.of(), 0, r0dump_LimitKind.NONE);
++    } catch (RuntimeException e) {
++      return new r0dump_SourceResult(
++          r0dump_Status.MALFORMED_XML, null, List.of(), 0, r0dump_LimitKind.NONE);
++    }
++    return r0dump_parseSource(parser, sourceOrdinal, limits, remainingComponents, remainingEvents);
++  }
++
++  static r0dump_SourceResult r0dump_parseSource(
++      XmlResourceParser parser,
++      int sourceOrdinal,
++      r0dump_Limits limits,
++      int remainingComponents,
++      int remainingEvents) {
++    if (remainingEvents <= 0) {
++      parser.close();
++      return new r0dump_SourceResult(
++          r0dump_Status.LIMIT_EXCEEDED, null, List.of(), 0, r0dump_LimitKind.TOTAL_EVENT_COUNT);
++    }
++
++    int eventCount = 0;
++    int applicationDepth = -1;
++    String packageName = null;
++    final ArrayList<r0dump_ClassSeed> seeds = new ArrayList<>();
++    try (parser) {
++      int event = parser.getEventType();
++      while (event != XmlPullParser.END_DOCUMENT) {
++        eventCount++;
++        if (eventCount > limits.maxEventsPerSource) {
++          throw new r0dump_LimitException(r0dump_LimitKind.SOURCE_EVENT_COUNT);
++        }
++        if (eventCount > remainingEvents) {
++          throw new r0dump_LimitException(r0dump_LimitKind.TOTAL_EVENT_COUNT);
++        }
++        if (parser.getDepth() > limits.maxXmlDepth) {
++          throw new r0dump_LimitException(r0dump_LimitKind.XML_DEPTH);
++        }
++        if (event == XmlPullParser.START_TAG) {
++          final int depth = parser.getDepth();
++          final String tag = parser.getName();
++          if (depth == 1 && "manifest".equals(tag)) {
++            packageName = r0dump_readAttribute(parser, null, "package", limits);
++          } else if (depth == 2 && "application".equals(tag)) {
++            applicationDepth = depth;
++            r0dump_addSeed(
++                seeds,
++                packageName,
++                r0dump_readAttribute(parser, ANDROID_NAMESPACE, "name", limits),
++                r0dump_SeedKind.APPLICATION,
++                sourceOrdinal,
++                remainingComponents,
++                limits);
++          } else if (depth == 2 && "instrumentation".equals(tag)) {
++            r0dump_addSeed(
++                seeds,
++                packageName,
++                r0dump_readAttribute(parser, ANDROID_NAMESPACE, "name", limits),
++                r0dump_SeedKind.INSTRUMENTATION,
++                sourceOrdinal,
++                remainingComponents,
++                limits);
++          } else if (applicationDepth > 0 && depth == applicationDepth + 1) {
++            final r0dump_SeedKind kind = r0dump_componentKind(tag);
++            if (kind != null) {
++              final String attribute =
++                  kind == r0dump_SeedKind.ACTIVITY_ALIAS_TARGET ? "targetActivity" : "name";
++              r0dump_addSeed(
++                  seeds,
++                  packageName,
++                  r0dump_readAttribute(parser, ANDROID_NAMESPACE, attribute, limits),
++                  kind,
++                  sourceOrdinal,
++                  remainingComponents,
++                  limits);
++            }
++          }
++        } else if (event == XmlPullParser.END_TAG && parser.getDepth() == applicationDepth) {
++          applicationDepth = -1;
++        }
++        event = parser.next();
++      }
++    } catch (r0dump_LimitException e) {
++      return new r0dump_SourceResult(
++          r0dump_Status.LIMIT_EXCEEDED, packageName, List.of(), eventCount, e.kind);
++    } catch (IOException e) {
++      return new r0dump_SourceResult(
++          eventCount == 0 ? r0dump_Status.XML_OPEN_FAILED : r0dump_Status.MALFORMED_XML,
++          packageName,
++          List.of(),
++          eventCount);
++    } catch (XmlPullParserException | RuntimeException e) {
++      return new r0dump_SourceResult(
++          r0dump_Status.MALFORMED_XML, packageName, List.of(), eventCount);
++    }
++
++    if (packageName == null || packageName.isEmpty()) {
++      return new r0dump_SourceResult(r0dump_Status.PACKAGE_MISSING, null, List.of(), eventCount);
++    }
++    return new r0dump_SourceResult(r0dump_Status.OK, packageName, seeds, eventCount);
++  }
++
++  private static String r0dump_readAttribute(
++      XmlResourceParser parser, String namespace, String name, r0dump_Limits limits)
++      throws r0dump_LimitException {
++    final String value = parser.getAttributeValue(namespace, name);
++    if (value != null && value.length() > limits.maxAttributeLength) {
++      throw new r0dump_LimitException(r0dump_LimitKind.ATTRIBUTE_LENGTH);
++    }
++    return value;
++  }
++
++  private static r0dump_SeedKind r0dump_componentKind(String tag) {
++    switch (tag) {
++      case "activity":
++        return r0dump_SeedKind.ACTIVITY;
++      case "activity-alias":
++        return r0dump_SeedKind.ACTIVITY_ALIAS_TARGET;
++      case "service":
++        return r0dump_SeedKind.SERVICE;
++      case "receiver":
++        return r0dump_SeedKind.RECEIVER;
++      case "provider":
++        return r0dump_SeedKind.PROVIDER;
++      default:
++        return null;
++    }
++  }
++
++  private static void r0dump_addSeed(
++      List<r0dump_ClassSeed> seeds,
++      String packageName,
++      String rawClassName,
++      r0dump_SeedKind kind,
++      int sourceOrdinal,
++      int maxComponents,
++      r0dump_Limits limits)
++      throws r0dump_LimitException {
++    final String className =
++        r0dump_normalizeClassName(packageName, rawClassName, limits.maxAttributeLength);
++    if (className == null) {
++      return;
++    }
++    if (seeds.size() >= maxComponents) {
++      throw new r0dump_LimitException(r0dump_LimitKind.COMPONENT_COUNT);
++    }
++    seeds.add(new r0dump_ClassSeed(className, kind, sourceOrdinal));
++  }
++
++  static String r0dump_normalizeClassName(
++      String packageName, String rawClassName, int maxAttributeLength) {
++    if (packageName == null
++        || packageName.isEmpty()
++        || rawClassName == null
++        || rawClassName.isEmpty()
++        || rawClassName.length() > maxAttributeLength) {
++      return null;
++    }
++
++    final String className;
++    if (rawClassName.charAt(0) == '.') {
++      className = packageName + rawClassName;
++    } else if (rawClassName.indexOf('.') < 0) {
++      className = packageName + "." + rawClassName;
++    } else {
++      className = rawClassName;
++    }
++    if (className.length() > maxAttributeLength
++        || className.indexOf('/') >= 0
++        || className.indexOf(';') >= 0
++        || className.indexOf('[') >= 0
++        || className.indexOf('\0') >= 0) {
++      return null;
++    }
++
++    int segmentStart = 0;
++    while (segmentStart < className.length()) {
++      final int segmentEnd = className.indexOf('.', segmentStart);
++      final int end = segmentEnd < 0 ? className.length() : segmentEnd;
++      if (end == segmentStart || !Character.isJavaIdentifierStart(className.charAt(segmentStart))) {
++        return null;
++      }
++      for (int i = segmentStart + 1; i < end; i++) {
++        if (!Character.isJavaIdentifierPart(className.charAt(i))) {
++          return null;
++        }
++      }
++      if (segmentEnd < 0) {
++        return className;
++      }
++      segmentStart = segmentEnd + 1;
++    }
++    return null;
++  }
++
++  private static r0dump_Snapshot r0dump_snapshot(
++      r0dump_Status status,
++      String packageName,
++      List<r0dump_ClassSeed> seeds,
++      int sourceCount,
++      int parsedSourceCount,
++      int rejectedSourceCount,
++      int xmlEventCount) {
++    return r0dump_snapshot(
++        status,
++        packageName,
++        seeds,
++        sourceCount,
++        parsedSourceCount,
++        rejectedSourceCount,
++        xmlEventCount,
++        r0dump_LimitKind.NONE);
++  }
++
++  private static r0dump_Snapshot r0dump_snapshot(
++      r0dump_Status status,
++      String packageName,
++      List<r0dump_ClassSeed> seeds,
++      int sourceCount,
++      int parsedSourceCount,
++      int rejectedSourceCount,
++      int xmlEventCount,
++      r0dump_LimitKind limitHit) {
++    final ArrayList<r0dump_ManifestSource> sources = new ArrayList<>(sourceCount);
++    for (int ordinal = 0; ordinal < sourceCount; ordinal++) {
++      sources.add(
++          r0dump_source(
++              ordinal,
++              ordinal == 0 ? status : r0dump_Status.DISABLED,
++              ordinal == 0 ? xmlEventCount : 0,
++              ordinal == 0 ? limitHit : r0dump_LimitKind.NONE));
++    }
++    return r0dump_snapshot(
++        status,
++        packageName,
++        seeds,
++        sourceCount,
++        parsedSourceCount,
++        rejectedSourceCount,
++        xmlEventCount,
++        limitHit,
++        sources);
++  }
++
++  private static r0dump_Snapshot r0dump_snapshot(
++      r0dump_Status status,
++      String packageName,
++      List<r0dump_ClassSeed> seeds,
++      int sourceCount,
++      int parsedSourceCount,
++      int rejectedSourceCount,
++      int xmlEventCount,
++      r0dump_LimitKind limitHit,
++      List<r0dump_ManifestSource> sources) {
++    final ArrayList<r0dump_ManifestSource> completeSources = new ArrayList<>(sources);
++    for (int ordinal = completeSources.size(); ordinal < sourceCount; ordinal++) {
++      completeSources.add(r0dump_source(ordinal, r0dump_Status.DISABLED, 0, null));
++    }
++    return new r0dump_Snapshot(
++        status,
++        packageName,
++        seeds,
++        completeSources,
++        sourceCount,
++        parsedSourceCount,
++        rejectedSourceCount,
++        xmlEventCount,
++        limitHit);
++  }
++
++  private static r0dump_ManifestSource r0dump_source(
++      int ordinal, r0dump_Status status, int eventCount, r0dump_LimitKind limitHit) {
++    return new r0dump_ManifestSource(
++        ordinal,
++        ordinal == 0 ? r0dump_SourceKind.BASE : r0dump_SourceKind.SPLIT,
++        status,
++        eventCount,
++        limitHit == null ? r0dump_LimitKind.NONE : limitHit);
++  }
++}
+diff --git a/core/res/AndroidManifest.xml b/core/res/AndroidManifest.xml
+index 769c3d3110dff9ebe0b204ad0f22cf0adefad3f6..2b3892e314c5be726121b2b48037eccf48452b17 100644
+--- a/core/res/AndroidManifest.xml
++++ b/core/res/AndroidManifest.xml
+@@ -2948,6 +2948,12 @@
+     <permission android:name="android.permission.MANAGE_DEBUGGING"
+         android:protectionLevel="signature|privileged" />
+ 
++    <!-- Allows the guarded r0dump Manager to request repair and export of captured artifacts.
++         <p>Not for use by third-party applications.
++         @hide -->
++    <permission android:name="android.permission.MANAGE_R0DUMP_EXPORT"
++        android:protectionLevel="signature|privileged" />
++
+     <!-- @SystemApi Allows an application to access the MTP USB kernel driver.
+          For use only by the device side MTP implementation.
+          @hide -->
+diff --git a/core/tests/coretests/Android.bp b/core/tests/coretests/Android.bp
+index 472e6d859316e0cd03f5c24320eda784cc738010..8eb6dd7cec98d42b537a9910997141e1fa6a1614 100644
+--- a/core/tests/coretests/Android.bp
++++ b/core/tests/coretests/Android.bp
+@@ -157,6 +157,43 @@ android_test {
+     ],
+ }
+ 
++// Keep the r0dump manifest parser's device test independent of the broad
++// FrameworksCoreTests compilation surface.  The test uses the same compiled
++// base/split APK fixtures as FrameworksCoreTests, but does not need its other
++// sources, resources, JNI libraries, or helper applications.
++android_test {
++    name: "r0dump_ManifestHelperTest",
++
++    srcs: [
++        "src/android/app/r0dump_FusionConfigTest.java",
++        "src/android/app/r0dump_ManifestHelperTest.java",
++    ],
++
++    dxflags: ["--core-library"],
++
++    static_libs: [
++        "androidx.test.core",
++        "androidx.test.ext.junit",
++        "androidx.test.runner",
++        "mockito-target-minus-junit4",
++        "truth",
++    ],
++
++    libs: [
++        "android.test.base.stubs",
++        "android.test.mock.stubs",
++        "android.test.runner.stubs",
++        "framework",
++        "framework-res",
++    ],
++
++    sdk_version: "core_platform",
++    test_suites: ["device-tests"],
++    certificate: "platform",
++
++    resource_zips: [":r0dump_ManifestHelperTest_apks_as_resources"],
++}
++
+ // Rules to copy all the test apks to the intermediate raw resource directory
+ java_genrule {
+     name: "FrameworksCoreTests_apks_as_resources",
+@@ -166,6 +203,9 @@ java_genrule {
+         ":FrameworksCoreTests_install_verifier_good",
+         ":FrameworksCoreTests_locales",
+         ":FrameworksCoreTests_overlay_config",
++        ":FrameworksCoreTests_r0dump_manifest_base",
++        ":FrameworksCoreTests_r0dump_manifest_mismatch",
++        ":FrameworksCoreTests_r0dump_manifest_split",
+         ":FrameworksCoreTests_version_1",
+         ":FrameworksCoreTests_version_1_diff",
+         ":FrameworksCoreTests_version_1_nosys",
+@@ -183,6 +223,23 @@ java_genrule {
+         "$(location soong_zip) -o $(out) -C $(genDir)/res -D $(genDir)/res",
+ }
+ 
++java_genrule {
++    name: "r0dump_ManifestHelperTest_apks_as_resources",
++    srcs: [
++        ":FrameworksCoreTests_r0dump_manifest_base",
++        ":FrameworksCoreTests_r0dump_manifest_mismatch",
++        ":FrameworksCoreTests_r0dump_manifest_split",
++    ],
++    out: ["r0dump_ManifestHelperTest_apks_as_resources.res.zip"],
++    tools: ["soong_zip"],
++
++    cmd: "mkdir -p $(genDir)/res/raw && " +
++        "for i in $(in); do " +
++        "  x=$${i##*FrameworksCoreTests_}; cp $$i $(genDir)/res/raw/$${x%.apk};" +
++        "done && " +
++        "$(location soong_zip) -o $(out) -C $(genDir)/res -D $(genDir)/res",
++}
++
+ // In addition to running as part of FrameworksCoreTests, we run (a subclass of)
+ // ChooserActivityTest against the unbundled ChooserActivity implementation in
+ // //packages/modules/IntentResolver/. The following library provides the
+diff --git a/core/tests/coretests/apks/r0dump_manifest/Android.bp b/core/tests/coretests/apks/r0dump_manifest/Android.bp
+new file mode 100644
+index 0000000000000000000000000000000000000000..c9ced973eda2b5ef073dc89a43e9a79df08d177f
+--- /dev/null
++++ b/core/tests/coretests/apks/r0dump_manifest/Android.bp
+@@ -0,0 +1,29 @@
++package {
++    default_applicable_licenses: ["frameworks_base_license"],
++}
++
++android_test_helper_app {
++    name: "FrameworksCoreTests_r0dump_manifest_base",
++    defaults: ["FrameworksCoreTests_apks_defaults"],
++    manifest: "base/AndroidManifest.xml",
++}
++
++android_test_helper_app {
++    name: "FrameworksCoreTests_r0dump_manifest_split",
++    defaults: ["FrameworksCoreTests_apks_defaults"],
++    manifest: "split/AndroidManifest.xml",
++}
++
++android_test_helper_app {
++    name: "FrameworksCoreTests_r0dump_manifest_mismatch",
++    defaults: ["FrameworksCoreTests_apks_defaults"],
++    manifest: "mismatch/AndroidManifest.xml",
++}
++
++android_test_helper_app {
++    name: "FrameworksCoreTests_r0dump_force_fixture",
++    manifest: "force/AndroidManifest.xml",
++    srcs: ["force/src/**/*.java"],
++    sdk_version: "current",
++    test_suites: ["device-tests"],
++}
+diff --git a/core/tests/coretests/apks/r0dump_manifest/base/AndroidManifest.xml b/core/tests/coretests/apks/r0dump_manifest/base/AndroidManifest.xml
+new file mode 100644
+index 0000000000000000000000000000000000000000..76c2106d9ef4b0eadcfa19b8d9409fb214d52da9
+--- /dev/null
++++ b/core/tests/coretests/apks/r0dump_manifest/base/AndroidManifest.xml
+@@ -0,0 +1,23 @@
++<?xml version="1.0" encoding="utf-8"?>
++<manifest xmlns:android="http://schemas.android.com/apk/res/android"
++    package="com.android.frameworks.coretests.r0dumpmanifest">
++    <application android:name=".BaseApplication" android:hasCode="false">
++        <activity android:name="RelativeActivity" android:exported="false" />
++        <activity android:name="com.example.FullActivity" android:exported="false" />
++        <activity android:name=".Outer$InnerActivity" android:exported="false" />
++        <activity-alias
++            android:name=".Alias"
++            android:targetActivity=".AliasTargetActivity"
++            android:exported="false" />
++        <service android:name=".RelativeActivity" android:exported="false" />
++        <service android:name=".BaseService" android:exported="false" />
++        <receiver android:name=".BaseReceiver" android:exported="false" />
++        <provider
++            android:name=".BaseProvider"
++            android:authorities="com.android.frameworks.coretests.r0dumpmanifest.provider"
++            android:exported="false" />
++    </application>
++    <instrumentation
++        android:name=".BaseInstrumentation"
++        android:targetPackage="com.android.frameworks.coretests.r0dumpmanifest" />
++</manifest>
+diff --git a/core/tests/coretests/apks/r0dump_manifest/force/AndroidManifest.xml b/core/tests/coretests/apks/r0dump_manifest/force/AndroidManifest.xml
+new file mode 100644
+index 0000000000000000000000000000000000000000..842fa81166b38292d67a35e97dc8c0839c8de59c
+--- /dev/null
++++ b/core/tests/coretests/apks/r0dump_manifest/force/AndroidManifest.xml
+@@ -0,0 +1,24 @@
++<?xml version="1.0" encoding="utf-8"?>
++<manifest xmlns:android="http://schemas.android.com/apk/res/android"
++    package="com.android.frameworks.coretests.r0dumpforce">
++
++    <application
++        android:name=".r0dump_ForceFixtureApplication"
++        android:label="r0dump force fixture"
++        android:theme="@android:style/Theme.Material.Light.NoActionBar">
++        <activity
++            android:name=".r0dump_ForceFixtureActivity"
++            android:exported="true">
++            <intent-filter>
++                <action android:name="android.intent.action.MAIN" />
++                <category android:name="android.intent.category.LAUNCHER" />
++            </intent-filter>
++        </activity>
++        <activity
++            android:name=".r0dump_ForceTargetActivity"
++            android:exported="false" />
++        <activity
++            android:name=".r0dump_ForceFailTargetActivity"
++            android:exported="false" />
++    </application>
++</manifest>
+diff --git a/core/tests/coretests/apks/r0dump_manifest/force/src/com/android/frameworks/coretests/r0dumpforce/r0dump_ForceFailTargetActivity.java b/core/tests/coretests/apks/r0dump_manifest/force/src/com/android/frameworks/coretests/r0dumpforce/r0dump_ForceFailTargetActivity.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..9f1931c5b717885bccb2e796b51773d3e7655e6e
+--- /dev/null
++++ b/core/tests/coretests/apks/r0dump_manifest/force/src/com/android/frameworks/coretests/r0dumpforce/r0dump_ForceFailTargetActivity.java
+@@ -0,0 +1,34 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.frameworks.coretests.r0dumpforce;
++
++import android.app.Activity;
++
++public final class r0dump_ForceFailTargetActivity extends Activity {
++  static {
++    r0dump_failInitialization();
++  }
++
++  private static void r0dump_failInitialization() {
++    r0dump_ForceFixtureApplication.r0dump_increment("r0dump_fail_clinit_count");
++    throw new IllegalStateException("controlled r0dump initialization failure");
++  }
++
++  public static void r0dump_target() {
++    r0dump_ForceFixtureApplication.r0dump_increment("r0dump_fail_target_count");
++  }
++}
+diff --git a/core/tests/coretests/apks/r0dump_manifest/force/src/com/android/frameworks/coretests/r0dumpforce/r0dump_ForceFixtureActivity.java b/core/tests/coretests/apks/r0dump_manifest/force/src/com/android/frameworks/coretests/r0dumpforce/r0dump_ForceFixtureActivity.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..750b72b6ef5c466b9f2561e803ebc3e9d8df6131
+--- /dev/null
++++ b/core/tests/coretests/apks/r0dump_manifest/force/src/com/android/frameworks/coretests/r0dumpforce/r0dump_ForceFixtureActivity.java
+@@ -0,0 +1,27 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.frameworks.coretests.r0dumpforce;
++
++import android.app.Activity;
++import android.os.Bundle;
++
++public final class r0dump_ForceFixtureActivity extends Activity {
++  @Override
++  protected void onCreate(Bundle savedInstanceState) {
++    super.onCreate(savedInstanceState);
++  }
++}
+diff --git a/core/tests/coretests/apks/r0dump_manifest/force/src/com/android/frameworks/coretests/r0dumpforce/r0dump_ForceFixtureApplication.java b/core/tests/coretests/apks/r0dump_manifest/force/src/com/android/frameworks/coretests/r0dumpforce/r0dump_ForceFixtureApplication.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..dca664cfb9ab40b8f46756864bfa93a57a187a85
+--- /dev/null
++++ b/core/tests/coretests/apks/r0dump_manifest/force/src/com/android/frameworks/coretests/r0dumpforce/r0dump_ForceFixtureApplication.java
+@@ -0,0 +1,44 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.frameworks.coretests.r0dumpforce;
++
++import android.app.Application;
++import android.content.SharedPreferences;
++
++public final class r0dump_ForceFixtureApplication extends Application {
++  private static final String r0dump_PREFS = "r0dump_force_counts";
++  private static r0dump_ForceFixtureApplication r0dump_instance;
++
++  @Override
++  public void onCreate() {
++    super.onCreate();
++    r0dump_instance = this;
++  }
++
++  static void r0dump_increment(String key) {
++    final r0dump_ForceFixtureApplication application = r0dump_instance;
++    if (application == null) {
++      throw new IllegalStateException("fixture application is not ready");
++    }
++    final SharedPreferences preferences =
++        application.getSharedPreferences(r0dump_PREFS, MODE_PRIVATE);
++    final int next = preferences.getInt(key, 0) + 1;
++    if (!preferences.edit().putInt(key, next).commit()) {
++      throw new IllegalStateException("fixture counter write failed");
++    }
++  }
++}
+diff --git a/core/tests/coretests/apks/r0dump_manifest/force/src/com/android/frameworks/coretests/r0dumpforce/r0dump_ForceTargetActivity.java b/core/tests/coretests/apks/r0dump_manifest/force/src/com/android/frameworks/coretests/r0dumpforce/r0dump_ForceTargetActivity.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c3b2287adbd20ca882d9a106f8a1d900448379b8
+--- /dev/null
++++ b/core/tests/coretests/apks/r0dump_manifest/force/src/com/android/frameworks/coretests/r0dumpforce/r0dump_ForceTargetActivity.java
+@@ -0,0 +1,29 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.frameworks.coretests.r0dumpforce;
++
++import android.app.Activity;
++
++public final class r0dump_ForceTargetActivity extends Activity {
++  static {
++    r0dump_ForceFixtureApplication.r0dump_increment("r0dump_clinit_count");
++  }
++
++  public static void r0dump_target() {
++    r0dump_ForceFixtureApplication.r0dump_increment("r0dump_target_count");
++  }
++}
+diff --git a/core/tests/coretests/apks/r0dump_manifest/mismatch/AndroidManifest.xml b/core/tests/coretests/apks/r0dump_manifest/mismatch/AndroidManifest.xml
+new file mode 100644
+index 0000000000000000000000000000000000000000..91768ae349af0816e67ace015cae01a43910d4be
+--- /dev/null
++++ b/core/tests/coretests/apks/r0dump_manifest/mismatch/AndroidManifest.xml
+@@ -0,0 +1,5 @@
++<?xml version="1.0" encoding="utf-8"?>
++<manifest xmlns:android="http://schemas.android.com/apk/res/android"
++    package="com.android.frameworks.coretests.r0dumpmismatch">
++    <application android:hasCode="false" />
++</manifest>
+diff --git a/core/tests/coretests/apks/r0dump_manifest/split/AndroidManifest.xml b/core/tests/coretests/apks/r0dump_manifest/split/AndroidManifest.xml
+new file mode 100644
+index 0000000000000000000000000000000000000000..ae4554aa539267daab5b92ef4cb7209560a711c6
+--- /dev/null
++++ b/core/tests/coretests/apks/r0dump_manifest/split/AndroidManifest.xml
+@@ -0,0 +1,9 @@
++<?xml version="1.0" encoding="utf-8"?>
++<manifest xmlns:android="http://schemas.android.com/apk/res/android"
++    package="com.android.frameworks.coretests.r0dumpmanifest"
++    split="feature">
++    <application android:hasCode="false">
++        <activity android:name=".FeatureActivity" android:exported="false" />
++        <service android:name=".FeatureService" android:exported="false" />
++    </application>
++</manifest>
+diff --git a/core/tests/coretests/src/android/app/r0dump_FusionConfigTest.java b/core/tests/coretests/src/android/app/r0dump_FusionConfigTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..396d72930b0df496934197c50d4020609438c358
+--- /dev/null
++++ b/core/tests/coretests/src/android/app/r0dump_FusionConfigTest.java
+@@ -0,0 +1,677 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.app;
++
++import static com.google.common.truth.Truth.assertThat;
++import static org.junit.Assert.assertThrows;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++import android.content.Context;
++import android.os.Process;
++import android.os.UserHandle;
++import androidx.test.ext.junit.runners.AndroidJUnit4;
++import java.io.File;
++import java.util.HashMap;
++import java.util.Map;
++import org.json.JSONException;
++import org.json.JSONObject;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++
++@RunWith(AndroidJUnit4.class)
++public class r0dump_FusionConfigTest {
++  private static final String PACKAGE_NAME = "bin.mt.plus";
++  private static final String PROCESS_NAME = "bin.mt.plus";
++  private static final String OUTPUT_PARENT =
++      "/storage/emulated/"
++          + UserHandle.getUserId(Process.myUid())
++          + "/Android/data/bin.mt.plus/files";
++
++  @Test
++  public void r0dump_publishIfEnabled_validTarget_publishesExactConfig() throws Exception {
++    final r0dump_RecordingPublisher publisher = new r0dump_RecordingPublisher();
++
++    assertThat(
++            r0dump_FusionConfig.r0dump_publishIfEnabled(
++                r0dump_validJson().toString(),
++                PACKAGE_NAME,
++                PROCESS_NAME,
++                OUTPUT_PARENT,
++                publisher))
++        .isTrue();
++
++    assertThat(publisher.callCount).isEqualTo(1);
++    assertThat(publisher.config.runId).isEqualTo("20260824T120000Z-a1b2c3d4");
++    assertThat(publisher.config.targetPackage).isEqualTo(PACKAGE_NAME);
++    assertThat(publisher.config.targetProcess).isEqualTo(PROCESS_NAME);
++    assertThat(publisher.config.capturePointMask).isEqualTo(0x180000000ffL);
++    assertThat(publisher.config.walkStart)
++        .isEqualTo(r0dump_FusionConfig.WALK_START_AFTER_APPLICATION_ON_CREATE);
++    assertThat(publisher.config.walkMode).isEqualTo(r0dump_FusionConfig.WALK_MODE_LOADED_ONLY);
++    assertThat(publisher.outputParent).isEqualTo(OUTPUT_PARENT);
++  }
++
++  @Test
++  public void r0dump_publishIfEnabled_disabled_doesNotPublish() throws Exception {
++    final JSONObject json = r0dump_validJson().put("enabled", false);
++    final r0dump_RecordingPublisher publisher = new r0dump_RecordingPublisher();
++
++    assertThat(
++            r0dump_FusionConfig.r0dump_publishIfEnabled(
++                json.toString(), PACKAGE_NAME, PROCESS_NAME, OUTPUT_PARENT, publisher))
++        .isFalse();
++    assertThat(publisher.callCount).isEqualTo(0);
++  }
++
++  @Test
++  public void r0dump_publishIfEnabled_nonTargetProcess_doesNotPublish() throws Exception {
++    final r0dump_RecordingPublisher publisher = new r0dump_RecordingPublisher();
++
++    assertThat(
++            r0dump_FusionConfig.r0dump_publishIfEnabled(
++                r0dump_validJson().toString(),
++                PACKAGE_NAME,
++                PACKAGE_NAME + ":child",
++                OUTPUT_PARENT,
++                publisher))
++        .isFalse();
++    assertThat(publisher.callCount).isEqualTo(0);
++  }
++
++  @Test
++  public void r0dump_publishIfEnabled_emptyTargetProcess_publishesForChildProcess()
++      throws Exception {
++    final JSONObject json = r0dump_validJson().put("target_process", "");
++    final r0dump_RecordingPublisher publisher = new r0dump_RecordingPublisher();
++    final String childProcess = PACKAGE_NAME + ":child";
++
++    assertThat(
++            r0dump_FusionConfig.r0dump_publishIfEnabled(
++                json.toString(), PACKAGE_NAME, childProcess, OUTPUT_PARENT, publisher))
++        .isTrue();
++    assertThat(publisher.callCount).isEqualTo(1);
++    assertThat(publisher.processName).isEqualTo(childProcess);
++  }
++
++  @Test
++  public void r0dump_publishIfEnabled_missingProcessIdentity_doesNotPublish() throws Exception {
++    final r0dump_RecordingPublisher publisher = new r0dump_RecordingPublisher();
++
++    assertThat(
++            r0dump_FusionConfig.r0dump_publishIfEnabled(
++                r0dump_validJson().toString(), PACKAGE_NAME, null, OUTPUT_PARENT, publisher))
++        .isFalse();
++    assertThat(
++            r0dump_FusionConfig.r0dump_publishIfEnabled(
++                r0dump_validJson().toString(), null, PROCESS_NAME, OUTPUT_PARENT, publisher))
++        .isFalse();
++    assertThat(publisher.callCount).isEqualTo(0);
++  }
++
++  @Test
++  public void r0dump_publishIfEnabled_nonCanonicalOutputParent_rejectsBeforePublish()
++      throws Exception {
++    final r0dump_RecordingPublisher publisher = new r0dump_RecordingPublisher();
++
++    assertThrows(
++        IllegalArgumentException.class,
++        () ->
++            r0dump_FusionConfig.r0dump_publishIfEnabled(
++                r0dump_validJson().toString(),
++                PACKAGE_NAME,
++                PROCESS_NAME,
++                "/storage/emulated/0/Android/data/other.package/files",
++                publisher));
++    assertThrows(
++        IllegalArgumentException.class,
++        () ->
++            r0dump_FusionConfig.r0dump_publishIfEnabled(
++                r0dump_validJson().toString(),
++                PACKAGE_NAME,
++                PROCESS_NAME,
++                "/storage/emulated/0/Android/data/bin.mt.plus/files/../escape",
++                publisher));
++    assertThrows(
++        IllegalArgumentException.class,
++        () ->
++            r0dump_FusionConfig.r0dump_publishIfEnabled(
++                r0dump_validJson().toString(),
++                PACKAGE_NAME,
++                PROCESS_NAME,
++                "/sdcard/Android/data/bin.mt.plus/files",
++                publisher));
++    assertThrows(
++        IllegalArgumentException.class,
++        () ->
++            r0dump_FusionConfig.r0dump_publishIfEnabled(
++                r0dump_validJson().toString(),
++                PACKAGE_NAME,
++                PROCESS_NAME,
++                "/storage/emulated/0",
++                publisher));
++    assertThat(publisher.callCount).isEqualTo(0);
++  }
++
++  @Test
++  public void r0dump_getOutputParent_usesApplicationExternalFilesDirectory() {
++    final Context context = mock(Context.class);
++    when(context.getExternalFilesDir(null)).thenReturn(new File(OUTPUT_PARENT));
++
++    assertThat(r0dump_FusionConfig.r0dump_getOutputParent(context)).isEqualTo(OUTPUT_PARENT);
++  }
++
++  @Test
++  public void r0dump_getOutputParent_unavailable_failsClosed() {
++    final Context context = mock(Context.class);
++    when(context.getExternalFilesDir(null)).thenReturn(null);
++
++    assertThat(r0dump_FusionConfig.r0dump_getOutputParent(context)).isNull();
++  }
++
++  @Test
++  public void r0dump_parse_rejectsMissingAndUnknownFields() throws Exception {
++    final JSONObject missing = r0dump_validJson();
++    missing.remove("walk_mode");
++    r0dump_assertInvalid(missing.toString());
++
++    r0dump_assertInvalid(r0dump_validJson().put("strategy", "everything").toString());
++  }
++
++  @Test
++  public void r0dump_parse_rejectsWrongTypesAndIntegerOverflow() throws Exception {
++    r0dump_assertInvalid(r0dump_validJson().put("enabled", "true").toString());
++    r0dump_assertInvalid(
++        r0dump_validJson().toString().replace("\"max_records\":512", "\"max_records\":512.5"));
++    r0dump_assertInvalid(r0dump_validJson().put("walk_delay_ms", 4294967296L).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("max_total_bytes", -1).toString());
++  }
++
++  @Test
++  public void r0dump_parse_rejectsNonStandardAndDuplicateJson() throws Exception {
++    r0dump_assertInvalid(r0dump_validJson().toString() + " trailing");
++    r0dump_assertInvalid("/*comment*/" + r0dump_validJson());
++    r0dump_assertInvalid(r0dump_validJson().toString().replaceFirst("\\{", "{\"schema\":1,"));
++  }
++
++  @Test
++  public void r0dump_parse_rejectsOversizedJson() {
++    r0dump_assertInvalid(" ".repeat(r0dump_FusionConfig.MAX_JSON_BYTES + 1));
++  }
++
++  @Test
++  public void r0dump_parse_rejectsMalformedMask() throws Exception {
++    r0dump_assertInvalid(r0dump_validJson().put("capture_point_mask", "0x1").toString());
++    r0dump_assertInvalid(
++        r0dump_validJson().put("capture_point_mask", "0X00000180000000ff").toString());
++    r0dump_assertInvalid(
++        r0dump_validJson().put("capture_point_mask", "0x0000040000000000").toString());
++    r0dump_assertInvalid(
++        r0dump_validJson().put("capture_point_mask", "0xgggggggggggggggg").toString());
++  }
++
++  @Test
++  public void r0dump_parse_rejectsInvalidSelectors() throws Exception {
++    r0dump_assertInvalid(r0dump_validJson().put("run_id", "../escape").toString());
++    r0dump_assertInvalid(r0dump_validJson().put("target_package", "bin..mt").toString());
++    r0dump_assertInvalid(r0dump_validJson().put("target_process", "other.process").toString());
++    r0dump_assertInvalid(r0dump_validJson().put("walk_start", "on_bind").toString());
++    r0dump_assertInvalid(r0dump_validJson().put("walk_mode", "all").toString());
++    r0dump_assertInvalid(
++        r0dump_validJson().put("force_method_descriptor", "(" + "I".repeat(90) + ")V").toString());
++  }
++
++  @Test
++  public void r0dump_parse_rejectsForceWithoutNoExecutePoint() throws Exception {
++    final JSONObject json =
++        r0dump_validJson()
++            .put("force_invoke_enabled", true)
++            .put("force_class", "bin.mt.plus.Target")
++            .put("force_method", "materialize")
++            .put("force_method_descriptor", "()V");
++    r0dump_assertInvalid(json.toString());
++  }
++
++  @Test
++  public void r0dump_parse_acceptsForceWithExactSelectorAndNoExecutePoint() throws Exception {
++    final JSONObject json =
++        r0dump_validJson()
++            .put("capture_point_mask", "0x0000020000000000")
++            .put("force_invoke_enabled", true)
++            .put("force_class", "bin.mt.plus.Target$Inner")
++            .put("force_method", "materialize")
++            .put("force_method_descriptor", "([Ljava/lang/String;I)V");
++
++    final r0dump_FusionConfig config = r0dump_FusionConfig.r0dump_parse(json.toString());
++
++    assertThat(config.forceInvokeEnabled).isTrue();
++    assertThat(config.forceClass).isEqualTo("bin.mt.plus.Target$Inner");
++  }
++
++  @Test
++  public void r0dump_parse_acceptsManifestNamespaceForceWithoutExactSelector() throws Exception {
++    final JSONObject json =
++        r0dump_validJson()
++            .put("capture_point_mask", "0x0000020000000000")
++            .put("manifest_enabled", true)
++            .put("force_invoke_enabled", true);
++
++    final r0dump_FusionConfig config = r0dump_FusionConfig.r0dump_parse(json.toString());
++
++    assertThat(config.forceInvokeEnabled).isTrue();
++    assertThat(config.forceClass).isEmpty();
++  }
++
++  @Test
++  public void r0dump_parse_rejectsForceWithoutManifestOrCompleteExactSelector() throws Exception {
++    final JSONObject noScope =
++        r0dump_validJson()
++            .put("capture_point_mask", "0x0000020000000000")
++            .put("manifest_enabled", false)
++            .put("force_invoke_enabled", true);
++    r0dump_assertInvalid(noScope.toString());
++    r0dump_assertInvalid(
++        noScope.put("manifest_enabled", true).put("force_class", "bin.mt.plus.Target").toString());
++  }
++
++  @Test
++  public void r0dump_parse_accepts128MiBDexAndRejectsLargerValue() throws Exception {
++    final long limit = 128L * 1024 * 1024;
++    final r0dump_FusionConfig config =
++        r0dump_FusionConfig.r0dump_parse(
++            r0dump_validJson()
++                .put("max_total_bytes", limit)
++                .put("max_dex_bytes", limit)
++                .put("buffer_pool_bytes", limit)
++                .toString());
++
++    assertThat(config.maxDexBytes).isEqualTo(limit);
++    r0dump_assertInvalid(
++        r0dump_validJson()
++            .put("max_total_bytes", limit + 1)
++            .put("max_dex_bytes", limit + 1)
++            .put("buffer_pool_bytes", limit + 1)
++            .toString());
++  }
++
++  @Test
++  public void r0dump_persistedProperties_roundTripCompleteImmutableSnapshot() throws Exception {
++    final r0dump_FakeProperties properties = new r0dump_FakeProperties();
++    final r0dump_FusionConfig expected =
++        r0dump_FusionConfig.r0dump_parse(
++            r0dump_validJson().put("anr_protection_enabled", true).toString());
++
++    assertThat(r0dump_FusionConfig.r0dump_writePersisted(expected, properties)).isTrue();
++    final r0dump_FusionConfig actual = r0dump_FusionConfig.r0dump_readPersisted(properties);
++
++    assertThat(properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "generation"))
++        .isEqualTo("2");
++    assertThat(actual.targetPackage).isEqualTo(PACKAGE_NAME);
++    assertThat(actual.maxRecords).isEqualTo(512L);
++    assertThat(actual.maxArtifacts).isEqualTo(128L);
++    assertThat(actual.maxTotalBytes).isEqualTo(201326592L);
++    assertThat(actual.maxDexBytes).isEqualTo(33554432L);
++    assertThat(actual.bufferPoolBytes).isEqualTo(67108864L);
++    assertThat(actual.maxCodeItemBytes).isEqualTo(1048576L);
++    assertThat(actual.maxFrozenGenerations).isEqualTo(4L);
++    assertThat(actual.flushIdleMs).isEqualTo(500L);
++    assertThat(actual.manifestMaxComponents).isEqualTo(8192L);
++    assertThat(actual.manifestMaxSplits).isEqualTo(32L);
++    assertThat(actual.manifestMaxEventsPerSource).isEqualTo(16384L);
++    assertThat(actual.manifestMaxTotalEvents).isEqualTo(65536L);
++    assertThat(actual.manifestMaxXmlDepth).isEqualTo(64L);
++    assertThat(actual.manifestMaxAttributeLength).isEqualTo(1024L);
++    assertThat(actual.walkDelayMs).isEqualTo(5000L);
++    assertThat(actual.walkMaxClasses).isEqualTo(2000L);
++    assertThat(actual.walkMaxMethods).isEqualTo(20000L);
++    assertThat(actual.forceMaxCalls).isEqualTo(1L);
++    assertThat(actual.anrProtectionEnabled).isTrue();
++    assertThat(
++            properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "anr_protection_enabled"))
++        .isEqualTo("1");
++  }
++
++  @Test
++  public void r0dump_persistedProperties_missingMaskUsesManagerDefaultPoints() throws Exception {
++    final r0dump_FakeProperties properties = new r0dump_FakeProperties();
++    final r0dump_FusionConfig expected =
++        r0dump_FusionConfig.r0dump_parse(r0dump_validJson().toString());
++    assertThat(r0dump_FusionConfig.r0dump_writePersisted(expected, properties)).isTrue();
++    properties.values.remove(r0dump_FusionConfig.PROPERTY_PREFIX + "capture_point_mask");
++
++    final r0dump_FusionConfig actual = r0dump_FusionConfig.r0dump_readPersisted(properties);
++
++    assertThat(actual.capturePointMask).isEqualTo(0x0000020000000028L);
++  }
++
++  @Test
++  public void r0dump_managerWrite_validatesPublishesAndVerifiesCompleteSnapshot() throws Exception {
++    final r0dump_FakeProperties properties = new r0dump_FakeProperties();
++    final String rawConfig = r0dump_validJson().toString();
++
++    assertThat(r0dump_FusionConfig.r0dump_writePersistedForManager(rawConfig, 0L, properties))
++        .isEqualTo(2L);
++    assertThat(properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "generation"))
++        .isEqualTo("2");
++    assertThat(properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "enabled"))
++        .isEqualTo("1");
++    assertThat(properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "run_id"))
++        .isEqualTo("20260824T120000Z-a1b2c3d4");
++
++    final IllegalStateException conflict =
++        assertThrows(
++            IllegalStateException.class,
++            () -> r0dump_FusionConfig.r0dump_writePersistedForManager(rawConfig, 0L, properties));
++    assertThat(conflict).hasMessageThat().isEqualTo("generation_conflict");
++  }
++
++  @Test
++  public void r0dump_managerDisableAndRecovery_commitDisabledEvenGeneration() throws Exception {
++    final r0dump_FakeProperties properties = new r0dump_FakeProperties();
++    r0dump_FusionConfig.r0dump_writePersistedForManager(
++        r0dump_validJson().toString(), 0L, properties);
++
++    assertThat(r0dump_FusionConfig.r0dump_disablePersistedForManager(2L, properties)).isEqualTo(4L);
++    assertThat(properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "generation"))
++        .isEqualTo("4");
++    assertThat(properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "enabled"))
++        .isEqualTo("0");
++    assertThat(properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "target_package"))
++        .isEqualTo(PACKAGE_NAME);
++
++    properties.values.put(r0dump_FusionConfig.PROPERTY_PREFIX + "generation", "5");
++    properties.values.put(r0dump_FusionConfig.PROPERTY_PREFIX + "enabled", "1");
++    assertThat(r0dump_FusionConfig.r0dump_recoverDisabledPersistedForManager(properties))
++        .isEqualTo(6L);
++    assertThat(properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "generation"))
++        .isEqualTo("6");
++    assertThat(properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "enabled"))
++        .isEqualTo("0");
++  }
++
++  @Test
++  public void r0dump_managerMutations_failClosedForInvalidGenerationAndReadbackMismatch()
++      throws Exception {
++    final r0dump_FakeProperties properties = new r0dump_FakeProperties();
++    properties.values.put(r0dump_FusionConfig.PROPERTY_PREFIX + "generation", "1");
++    final IllegalStateException inProgress =
++        assertThrows(
++            IllegalStateException.class,
++            () ->
++                r0dump_FusionConfig.r0dump_writePersistedForManager(
++                    r0dump_validJson().toString(), 0L, properties));
++    assertThat(inProgress).hasMessageThat().isEqualTo("generation_in_progress");
++
++    properties.values.put(r0dump_FusionConfig.PROPERTY_PREFIX + "generation", "0");
++    properties.corruptPropertyReads = true;
++    final IllegalStateException readbackMismatch =
++        assertThrows(
++            IllegalStateException.class,
++            () ->
++                r0dump_FusionConfig.r0dump_writePersistedForManager(
++                    r0dump_validJson().toString(), 0L, properties));
++    assertThat(readbackMismatch).hasMessageThat().isEqualTo("property_verification_failed");
++  }
++
++  @Test
++  public void r0dump_managerWrite_fieldFailureLeavesOddGenerationForRecovery() throws Exception {
++    final r0dump_FakeProperties properties = new r0dump_FakeProperties();
++    properties.failAfterSets = 1;
++
++    final IllegalStateException failure =
++        assertThrows(
++            IllegalStateException.class,
++            () ->
++                r0dump_FusionConfig.r0dump_writePersistedForManager(
++                    r0dump_validJson().toString(), 0L, properties));
++
++    assertThat(failure).hasMessageThat().isEqualTo("property_write_failed");
++    assertThat(properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "generation"))
++        .isEqualTo("1");
++  }
++
++  @Test
++  public void r0dump_shouldProtectAnr_requiresEnabledFlagAndExactTarget() throws Exception {
++    final r0dump_FusionConfig protectedConfig =
++        r0dump_FusionConfig.r0dump_parse(
++            r0dump_validJson().put("anr_protection_enabled", true).toString());
++
++    assertThat(
++            r0dump_FusionConfig.r0dump_shouldProtectAnr(
++                protectedConfig, Process.SYSTEM_UID, PACKAGE_NAME, PROCESS_NAME))
++        .isTrue();
++    assertThat(
++            r0dump_FusionConfig.r0dump_shouldProtectAnr(
++                protectedConfig, Process.SYSTEM_UID, PACKAGE_NAME, PACKAGE_NAME + ":child"))
++        .isFalse();
++    assertThat(
++            r0dump_FusionConfig.r0dump_shouldProtectAnr(
++                protectedConfig, Process.SYSTEM_UID, "other.package", PROCESS_NAME))
++        .isFalse();
++
++    final r0dump_FusionConfig allProcessesConfig =
++        r0dump_FusionConfig.r0dump_parse(
++            r0dump_validJson()
++                .put("anr_protection_enabled", true)
++                .put("target_process", "")
++                .toString());
++    assertThat(
++            r0dump_FusionConfig.r0dump_shouldProtectAnr(
++                allProcessesConfig, Process.SYSTEM_UID, PACKAGE_NAME, PACKAGE_NAME + ":child"))
++        .isTrue();
++
++    final r0dump_FusionConfig unprotectedConfig =
++        r0dump_FusionConfig.r0dump_parse(r0dump_validJson().toString());
++    assertThat(
++            r0dump_FusionConfig.r0dump_shouldProtectAnr(
++                unprotectedConfig, Process.SYSTEM_UID, PACKAGE_NAME, PROCESS_NAME))
++        .isFalse();
++  }
++
++  @Test
++  public void r0dump_systemUserBoundary_rejectsSecondaryUserForAnr() throws Exception {
++    final r0dump_FusionConfig protectedConfig =
++        r0dump_FusionConfig.r0dump_parse(
++            r0dump_validJson().put("anr_protection_enabled", true).toString());
++    final int secondaryUserUid = UserHandle.PER_USER_RANGE + 10000;
++
++    assertThat(r0dump_FusionConfig.r0dump_isSystemUserUid(Process.SYSTEM_UID)).isTrue();
++    assertThat(r0dump_FusionConfig.r0dump_isSystemUserUid(secondaryUserUid)).isFalse();
++    assertThat(
++            r0dump_FusionConfig.r0dump_shouldProtectAnr(
++                protectedConfig, secondaryUserUid, PACKAGE_NAME, PROCESS_NAME))
++        .isFalse();
++  }
++
++  @Test
++  public void r0dump_persistedProperties_oddOrChangedGenerationFailsClosed() throws Exception {
++    final r0dump_FakeProperties properties = new r0dump_FakeProperties();
++    final r0dump_FusionConfig config =
++        r0dump_FusionConfig.r0dump_parse(r0dump_validJson().toString());
++    assertThat(r0dump_FusionConfig.r0dump_writePersisted(config, properties)).isTrue();
++
++    properties.values.put(r0dump_FusionConfig.PROPERTY_PREFIX + "generation", "3");
++    assertThrows(
++        IllegalArgumentException.class, () -> r0dump_FusionConfig.r0dump_readPersisted(properties));
++
++    properties.values.put(r0dump_FusionConfig.PROPERTY_PREFIX + "generation", "4");
++    properties.generationReads = 0;
++    properties.changeGenerationAfterFirstRead = true;
++    assertThrows(
++        IllegalArgumentException.class, () -> r0dump_FusionConfig.r0dump_readPersisted(properties));
++  }
++
++  @Test
++  public void r0dump_persistedProperties_disabledSnapshotUsesSafeDefaults() {
++    final r0dump_FakeProperties properties = new r0dump_FakeProperties();
++    properties.values.put(r0dump_FusionConfig.PROPERTY_PREFIX + "generation", "0");
++
++    assertThat(r0dump_FusionConfig.r0dump_readPersisted(properties)).isNull();
++  }
++
++  @Test
++  public void r0dump_outputPreparation_revalidatesStableGenerationAndIdentity() throws Exception {
++    final r0dump_FakeProperties properties = new r0dump_FakeProperties();
++    final r0dump_FusionConfig config =
++        r0dump_FusionConfig.r0dump_parse(r0dump_validJson().toString());
++    assertThat(r0dump_FusionConfig.r0dump_writePersisted(config, properties)).isTrue();
++
++    assertThat(
++            r0dump_FusionConfig.r0dump_validateOutputPreparationForSystemServer(
++                2L, 10001, PACKAGE_NAME, PROCESS_NAME, "20260824T120000Z-a1b2c3d4", properties))
++        .isTrue();
++    assertThat(
++            r0dump_FusionConfig.r0dump_validateOutputPreparationForSystemServer(
++                4L, 10001, PACKAGE_NAME, PROCESS_NAME, "20260824T120000Z-a1b2c3d4", properties))
++        .isFalse();
++    assertThat(
++            r0dump_FusionConfig.r0dump_validateOutputPreparationForSystemServer(
++                2L, 10001, PACKAGE_NAME, PROCESS_NAME, "other-run", properties))
++        .isFalse();
++  }
++
++  @Test
++  public void r0dump_parse_rejectsConfigurableLimitCeilingsAndRelationships() throws Exception {
++    r0dump_FusionConfig.r0dump_parse(
++        r0dump_validJson()
++            .put("max_total_bytes", 1073741824L)
++            .put("max_dex_bytes", 268435456L)
++            .put("buffer_pool_bytes", 536870912L)
++            .put("max_code_item_bytes", 4194304L)
++            .toString());
++    r0dump_assertInvalid(r0dump_validJson().put("max_records", 4097).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("max_artifacts", 513).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("max_total_bytes", 1073741825L).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("max_dex_bytes", 268435457L).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("buffer_pool_bytes", 33554431).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("buffer_pool_bytes", 536870913L).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("max_code_item_bytes", 4194305L).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("max_frozen_generations", 5).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("flush_idle_ms", 60001).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("manifest_max_components", 16385).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("manifest_max_splits", 33).toString());
++    r0dump_assertInvalid(
++        r0dump_validJson()
++            .put("manifest_max_events_per_source", 262145)
++            .put("manifest_max_total_events", 262145)
++            .toString());
++    r0dump_assertInvalid(r0dump_validJson().put("manifest_max_total_events", 16383).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("manifest_max_total_events", 1048577).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("manifest_max_xml_depth", 257).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("manifest_max_attribute_length", 4097).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("walk_max_classes", 1000001).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("walk_max_methods", 10000001).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("force_max_calls", 10000001).toString());
++  }
++
++  private static void r0dump_assertInvalid(String rawConfig) {
++    assertThrows(IllegalArgumentException.class, () -> r0dump_FusionConfig.r0dump_parse(rawConfig));
++  }
++
++  private static JSONObject r0dump_validJson() throws JSONException {
++    return new JSONObject()
++        .put("schema", 1)
++        .put("enabled", true)
++        .put("run_id", "20260824T120000Z-a1b2c3d4")
++        .put("target_package", PACKAGE_NAME)
++        .put("target_process", PROCESS_NAME)
++        .put("capture_point_mask", "0x00000180000000ff")
++        .put("max_records", 512)
++        .put("max_artifacts", 128)
++        .put("max_total_bytes", 201326592)
++        .put("max_dex_bytes", 33554432)
++        .put("buffer_pool_bytes", 67108864)
++        .put("max_code_item_bytes", 1048576)
++        .put("max_frozen_generations", 4)
++        .put("flush_idle_ms", 500)
++        .put("manifest_enabled", true)
++        .put("manifest_include_splits", true)
++        .put("manifest_max_components", 8192)
++        .put("manifest_max_splits", 32)
++        .put("manifest_max_events_per_source", 16384)
++        .put("manifest_max_total_events", 65536)
++        .put("manifest_max_xml_depth", 64)
++        .put("manifest_max_attribute_length", 1024)
++        .put("walk_enabled", true)
++        .put("walk_start", "after_application_on_create")
++        .put("walk_mode", "loaded_only")
++        .put("walk_delay_ms", 5000)
++        .put("walk_max_classes", 2000)
++        .put("walk_max_methods", 20000)
++        .put("force_invoke_enabled", false)
++        .put("force_class", "")
++        .put("force_method", "")
++        .put("force_method_descriptor", "")
++        .put("force_max_calls", 1)
++        .put("anr_protection_enabled", false);
++  }
++
++  private static final class r0dump_RecordingPublisher
++      implements r0dump_FusionConfig.r0dump_Publisher {
++    int callCount;
++    r0dump_FusionConfig config;
++    String processName;
++    String outputParent;
++    int preparedDirectoryFd;
++
++    @Override
++    public boolean r0dump_publish(
++        r0dump_FusionConfig config,
++        String processName,
++        String outputParent,
++        int preparedDirectoryFd) {
++      callCount++;
++      this.config = config;
++      this.processName = processName;
++      this.outputParent = outputParent;
++      this.preparedDirectoryFd = preparedDirectoryFd;
++      return true;
++    }
++  }
++
++  private static final class r0dump_FakeProperties
++      implements r0dump_FusionConfig.r0dump_PropertyAccess {
++    final Map<String, String> values = new HashMap<>();
++    boolean changeGenerationAfterFirstRead;
++    boolean corruptPropertyReads;
++    int failAfterSets = -1;
++    int setCalls;
++    int generationReads;
++
++    @Override
++    public String r0dump_get(String key, String defaultValue) {
++      if (key.equals(r0dump_FusionConfig.PROPERTY_PREFIX + "generation")) {
++        generationReads++;
++        if (changeGenerationAfterFirstRead && generationReads > 1) {
++          return Long.toString(Long.parseLong(values.get(key)) + 2L);
++        }
++      }
++      if (corruptPropertyReads && key.endsWith("run_id")) {
++        return "corrupt";
++      }
++      return values.getOrDefault(key, defaultValue);
++    }
++
++    @Override
++    public void r0dump_set(String key, String value) {
++      if (failAfterSets >= 0 && setCalls++ >= failAfterSets) {
++        throw new IllegalStateException("injected_write_failure");
++      }
++      values.put(key, value);
++    }
++  }
++}
+diff --git a/core/tests/coretests/src/android/app/r0dump_ManifestHelperTest.java b/core/tests/coretests/src/android/app/r0dump_ManifestHelperTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..de9cee293cdd08ad3adb78290a6d3672f4eaf82c
+--- /dev/null
++++ b/core/tests/coretests/src/android/app/r0dump_ManifestHelperTest.java
+@@ -0,0 +1,451 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.app;
++
++import static com.google.common.truth.Truth.assertThat;
++import static org.junit.Assert.assertThrows;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++import android.content.Context;
++import android.content.pm.ApplicationInfo;
++import android.content.res.AssetManager;
++import android.content.res.XmlResourceParser;
++import android.os.FileUtils;
++import androidx.test.ext.junit.runners.AndroidJUnit4;
++import androidx.test.platform.app.InstrumentationRegistry;
++import com.android.frameworks.coretests.R;
++import java.io.File;
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.ArrayList;
++import java.util.List;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.xmlpull.v1.XmlPullParser;
++import org.xmlpull.v1.XmlPullParserException;
++
++@RunWith(AndroidJUnit4.class)
++public class r0dump_ManifestHelperTest {
++  private static final String PACKAGE_NAME = "com.android.frameworks.coretests.r0dumpmanifest";
++
++  private Context mContext;
++  private AssetManager mAssets;
++  private LoadedApk mLoadedApk;
++  private String mBasePath;
++  private String mMismatchPath;
++  private String mSplitPath;
++
++  @Test
++  public void r0dump_manifestNamespacePrefixes_derivesAndMinimizesPackages() {
++    final r0dump_ManifestHelper.r0dump_Snapshot snapshot =
++        new r0dump_ManifestHelper.r0dump_Snapshot(
++            r0dump_ManifestHelper.r0dump_Status.OK,
++            "com.example.app",
++            List.of(
++                new r0dump_ManifestHelper.r0dump_ClassSeed(
++                    "com.example.app.MainApplication",
++                    r0dump_ManifestHelper.r0dump_SeedKind.APPLICATION,
++                    0),
++                new r0dump_ManifestHelper.r0dump_ClassSeed(
++                    "com.example.app.feature.MainActivity",
++                    r0dump_ManifestHelper.r0dump_SeedKind.ACTIVITY,
++                    0),
++                new r0dump_ManifestHelper.r0dump_ClassSeed(
++                    "vendor.push.MessageReceiver",
++                    r0dump_ManifestHelper.r0dump_SeedKind.RECEIVER,
++                    0)),
++            List.of(),
++            1,
++            1,
++            0,
++            0,
++            r0dump_ManifestHelper.r0dump_LimitKind.NONE);
++
++    assertThat(r0dump_ClassLoaderWalk.r0dump_manifestNamespacePrefixes(snapshot))
++        .containsExactly("com.example.app.", "vendor.push.")
++        .inOrder();
++  }
++
++  @Test
++  public void r0dump_matchesNamespace_requiresPackageBoundaryPrefix() {
++    final List<String> prefixes = List.of("com.example.app.");
++
++    assertThat(r0dump_ClassLoaderWalk.r0dump_matchesNamespace("com.example.app.Target", prefixes))
++        .isTrue();
++    assertThat(
++            r0dump_ClassLoaderWalk.r0dump_matchesNamespace(
++                "com.example.app.feature.Target", prefixes))
++        .isTrue();
++    assertThat(
++            r0dump_ClassLoaderWalk.r0dump_matchesNamespace(
++                "com.example.application.Target", prefixes))
++        .isFalse();
++  }
++
++  @Before
++  public void r0dump_setUp() throws Exception {
++    mContext = InstrumentationRegistry.getInstrumentation().getTargetContext();
++    mBasePath = r0dump_extractApk(R.raw.r0dump_manifest_base);
++    mMismatchPath = r0dump_extractApk(R.raw.r0dump_manifest_mismatch);
++    mSplitPath = r0dump_extractApk(R.raw.r0dump_manifest_split);
++    mAssets = new AssetManager();
++    assertThat(mAssets.addAssetPath(mBasePath)).isGreaterThan(0);
++    assertThat(mAssets.addAssetPath(mMismatchPath)).isGreaterThan(0);
++    assertThat(mAssets.addAssetPath(mSplitPath)).isGreaterThan(0);
++    mLoadedApk = mock(LoadedApk.class);
++    when(mLoadedApk.getAssets()).thenReturn(mAssets);
++  }
++
++  @After
++  public void r0dump_tearDown() {
++    if (mAssets != null) {
++      mAssets.close();
++    }
++  }
++
++  @Test
++  public void r0dump_parse_compiledBaseAndSplit_returnsExpectedSeeds() {
++    final ApplicationInfo appInfo = r0dump_applicationInfo(true);
++
++    final r0dump_ManifestHelper.r0dump_Snapshot snapshot =
++        r0dump_parse(mLoadedApk, appInfo, PACKAGE_NAME, true, 8192);
++
++    assertThat(snapshot.status).isEqualTo(r0dump_ManifestHelper.r0dump_Status.OK);
++    assertThat(snapshot.packageName).isEqualTo(PACKAGE_NAME);
++    assertThat(snapshot.sourceCount).isEqualTo(2);
++    assertThat(snapshot.parsedSourceCount).isEqualTo(2);
++    assertThat(snapshot.rejectedSourceCount).isEqualTo(0);
++    assertThat(snapshot.xmlEventCount).isGreaterThan(0);
++    assertThat(snapshot.sources).hasSize(2);
++    assertThat(snapshot.sources.get(0).ordinal).isEqualTo(0);
++    assertThat(snapshot.sources.get(0).kind)
++        .isEqualTo(r0dump_ManifestHelper.r0dump_SourceKind.BASE);
++    assertThat(snapshot.sources.get(0).status).isEqualTo(r0dump_ManifestHelper.r0dump_Status.OK);
++    assertThat(snapshot.sources.get(0).eventCount).isGreaterThan(0);
++    assertThat(snapshot.sources.get(1).ordinal).isEqualTo(1);
++    assertThat(snapshot.sources.get(1).kind)
++        .isEqualTo(r0dump_ManifestHelper.r0dump_SourceKind.SPLIT);
++    assertThat(snapshot.sources.get(1).status).isEqualTo(r0dump_ManifestHelper.r0dump_Status.OK);
++    assertThat(r0dump_seedNames(snapshot))
++        .containsExactly(
++            PACKAGE_NAME + ".BaseApplication",
++            PACKAGE_NAME + ".RelativeActivity",
++            "com.example.FullActivity",
++            PACKAGE_NAME + ".Outer$InnerActivity",
++            PACKAGE_NAME + ".AliasTargetActivity",
++            PACKAGE_NAME + ".RelativeActivity",
++            PACKAGE_NAME + ".BaseService",
++            PACKAGE_NAME + ".BaseReceiver",
++            PACKAGE_NAME + ".BaseProvider",
++            PACKAGE_NAME + ".BaseInstrumentation",
++            PACKAGE_NAME + ".FeatureActivity",
++            PACKAGE_NAME + ".FeatureService")
++        .inOrder();
++    assertThat(snapshot.seeds.get(4).kind)
++        .isEqualTo(r0dump_ManifestHelper.r0dump_SeedKind.ACTIVITY_ALIAS_TARGET);
++    assertThat(snapshot.seeds.get(5).kind).isEqualTo(r0dump_ManifestHelper.r0dump_SeedKind.SERVICE);
++    assertThat(snapshot.seeds.get(10).sourceOrdinal).isEqualTo(1);
++  }
++
++  @Test
++  public void r0dump_parse_splitsDisabled_onlyParsesBase() {
++    final r0dump_ManifestHelper.r0dump_Snapshot snapshot =
++        r0dump_parse(mLoadedApk, r0dump_applicationInfo(true), PACKAGE_NAME, false, 8192);
++
++    assertThat(snapshot.status).isEqualTo(r0dump_ManifestHelper.r0dump_Status.OK);
++    assertThat(snapshot.sourceCount).isEqualTo(1);
++    assertThat(snapshot.parsedSourceCount).isEqualTo(1);
++    assertThat(r0dump_seedNames(snapshot)).doesNotContain(PACKAGE_NAME + ".FeatureActivity");
++  }
++
++  @Test
++  public void r0dump_parse_missingSplitCookie_preservesBaseAndReportsPartialFailure() {
++    final ApplicationInfo appInfo = r0dump_applicationInfo(false);
++    appInfo.splitSourceDirs = new String[] {mContext.getFilesDir() + "/missing.apk"};
++
++    final r0dump_ManifestHelper.r0dump_Snapshot snapshot =
++        r0dump_parse(mLoadedApk, appInfo, PACKAGE_NAME, true, 8192);
++
++    assertThat(snapshot.status)
++        .isEqualTo(r0dump_ManifestHelper.r0dump_Status.PARTIAL_SPLIT_FAILURE);
++    assertThat(snapshot.parsedSourceCount).isEqualTo(1);
++    assertThat(snapshot.rejectedSourceCount).isEqualTo(1);
++    assertThat(snapshot.sources.get(1).status)
++        .isEqualTo(r0dump_ManifestHelper.r0dump_Status.ASSET_COOKIE_MISSING);
++    assertThat(r0dump_seedNames(snapshot)).contains(PACKAGE_NAME + ".BaseApplication");
++  }
++
++  @Test
++  public void r0dump_parse_missingBaseCookie_returnsEmptySnapshot() {
++    final ApplicationInfo appInfo = r0dump_applicationInfo(true);
++    appInfo.sourceDir = mContext.getFilesDir() + "/missing.apk";
++
++    final r0dump_ManifestHelper.r0dump_Snapshot snapshot =
++        r0dump_parse(mLoadedApk, appInfo, PACKAGE_NAME, true, 8192);
++
++    assertThat(snapshot.status).isEqualTo(r0dump_ManifestHelper.r0dump_Status.ASSET_COOKIE_MISSING);
++    assertThat(snapshot.seeds).isEmpty();
++    assertThat(snapshot.sources).hasSize(2);
++    assertThat(snapshot.sources.get(0).kind)
++        .isEqualTo(r0dump_ManifestHelper.r0dump_SourceKind.BASE);
++    assertThat(snapshot.sources.get(0).status)
++        .isEqualTo(r0dump_ManifestHelper.r0dump_Status.ASSET_COOKIE_MISSING);
++    assertThat(snapshot.sources.get(1).kind)
++        .isEqualTo(r0dump_ManifestHelper.r0dump_SourceKind.SPLIT);
++    assertThat(snapshot.sources.get(1).status)
++        .isEqualTo(r0dump_ManifestHelper.r0dump_Status.DISABLED);
++  }
++
++  @Test
++  public void r0dump_parse_packageMismatch_returnsEmptySnapshot() {
++    final r0dump_ManifestHelper.r0dump_Snapshot snapshot =
++        r0dump_parse(mLoadedApk, r0dump_applicationInfo(false), "different.package", false, 8192);
++
++    assertThat(snapshot.status).isEqualTo(r0dump_ManifestHelper.r0dump_Status.PACKAGE_MISMATCH);
++    assertThat(snapshot.seeds).isEmpty();
++  }
++
++  @Test
++  public void r0dump_parse_splitPackageMismatch_preservesBase() throws Exception {
++    final ApplicationInfo appInfo = r0dump_applicationInfo(false);
++    appInfo.splitSourceDirs = new String[] {mMismatchPath};
++
++    final r0dump_ManifestHelper.r0dump_Snapshot snapshot =
++        r0dump_parse(mLoadedApk, appInfo, PACKAGE_NAME, true, 8192);
++
++    assertThat(snapshot.status)
++        .isEqualTo(r0dump_ManifestHelper.r0dump_Status.PARTIAL_SPLIT_FAILURE);
++    assertThat(snapshot.parsedSourceCount).isEqualTo(1);
++    assertThat(snapshot.rejectedSourceCount).isEqualTo(1);
++    assertThat(snapshot.sources.get(1).status)
++        .isEqualTo(r0dump_ManifestHelper.r0dump_Status.PACKAGE_MISMATCH);
++  }
++
++  @Test
++  public void r0dump_parse_ignoresAssetManagerSourcesOutsideApplicationInfo() {
++    final r0dump_ManifestHelper.r0dump_Snapshot snapshot =
++        r0dump_parse(mLoadedApk, r0dump_applicationInfo(false), PACKAGE_NAME, true, 8192);
++
++    assertThat(snapshot.status).isEqualTo(r0dump_ManifestHelper.r0dump_Status.OK);
++    assertThat(snapshot.sources).hasSize(1);
++    assertThat(snapshot.sourceCount).isEqualTo(1);
++    assertThat(snapshot.rejectedSourceCount).isEqualTo(0);
++    assertThat(snapshot.packageName).isEqualTo(PACKAGE_NAME);
++  }
++
++  @Test
++  public void r0dump_parse_moreThanMaximumSplits_reportsSourceCountLimit() {
++    final ApplicationInfo appInfo = r0dump_applicationInfo(false);
++    appInfo.splitSourceDirs = new String[33];
++    for (int i = 0; i < appInfo.splitSourceDirs.length; i++) {
++      appInfo.splitSourceDirs[i] = mSplitPath;
++    }
++
++    final r0dump_ManifestHelper.r0dump_Snapshot snapshot =
++        r0dump_parse(mLoadedApk, appInfo, PACKAGE_NAME, true, 8192);
++
++    assertThat(snapshot.status).isEqualTo(r0dump_ManifestHelper.r0dump_Status.LIMIT_EXCEEDED);
++    assertThat(snapshot.limitHit).isEqualTo(r0dump_ManifestHelper.r0dump_LimitKind.SOURCE_COUNT);
++    assertThat(snapshot.parsedSourceCount).isEqualTo(0);
++    assertThat(snapshot.seeds).isEmpty();
++  }
++
++  @Test
++  public void r0dump_parseSource_missingPackage_closesParser() throws Exception {
++    final XmlResourceParser parser = mock(XmlResourceParser.class);
++    when(parser.getEventType()).thenReturn(XmlPullParser.END_DOCUMENT);
++
++    final r0dump_ManifestHelper.r0dump_SourceResult result =
++        r0dump_parseSource(parser, 0, 8192, 65536);
++
++    assertThat(result.status).isEqualTo(r0dump_ManifestHelper.r0dump_Status.PACKAGE_MISSING);
++    verify(parser).close();
++  }
++
++  @Test
++  public void r0dump_parseSource_truncatedXml_closesParser() throws Exception {
++    final XmlResourceParser parser = mock(XmlResourceParser.class);
++    when(parser.getEventType()).thenReturn(XmlPullParser.START_DOCUMENT);
++    when(parser.next()).thenThrow(new XmlPullParserException("truncated"));
++
++    final r0dump_ManifestHelper.r0dump_SourceResult result =
++        r0dump_parseSource(parser, 0, 8192, 65536);
++
++    assertThat(result.status).isEqualTo(r0dump_ManifestHelper.r0dump_Status.MALFORMED_XML);
++    verify(parser).close();
++  }
++
++  @Test
++  public void r0dump_parseSource_ioAndRuntimeFailures_closeParser() throws Exception {
++    final XmlResourceParser ioParser = mock(XmlResourceParser.class);
++    when(ioParser.getEventType()).thenReturn(XmlPullParser.START_DOCUMENT);
++    when(ioParser.next()).thenThrow(new IOException("short read"));
++    assertThat(r0dump_parseSource(ioParser, 0, 8192, 65536).status)
++        .isEqualTo(r0dump_ManifestHelper.r0dump_Status.MALFORMED_XML);
++    verify(ioParser).close();
++
++    final XmlResourceParser runtimeParser = mock(XmlResourceParser.class);
++    when(runtimeParser.getEventType()).thenThrow(new IllegalStateException("bad parser state"));
++    assertThat(r0dump_parseSource(runtimeParser, 0, 8192, 65536).status)
++        .isEqualTo(r0dump_ManifestHelper.r0dump_Status.MALFORMED_XML);
++    verify(runtimeParser).close();
++  }
++
++  @Test
++  public void r0dump_parseSource_eventDepthAndAttributeLimits_closeParser() throws Exception {
++    final XmlResourceParser eventParser = mock(XmlResourceParser.class);
++    when(eventParser.getEventType()).thenReturn(XmlPullParser.START_DOCUMENT);
++    when(eventParser.next()).thenReturn(XmlPullParser.START_DOCUMENT);
++    final r0dump_ManifestHelper.r0dump_SourceResult eventResult =
++        r0dump_parseSource(eventParser, 0, 8192, 65536);
++    assertThat(eventResult.status).isEqualTo(r0dump_ManifestHelper.r0dump_Status.LIMIT_EXCEEDED);
++    assertThat(eventResult.limitHit)
++        .isEqualTo(r0dump_ManifestHelper.r0dump_LimitKind.SOURCE_EVENT_COUNT);
++    verify(eventParser).close();
++
++    final XmlResourceParser totalEventParser = mock(XmlResourceParser.class);
++    when(totalEventParser.getEventType()).thenReturn(XmlPullParser.START_DOCUMENT);
++    when(totalEventParser.next()).thenReturn(XmlPullParser.START_DOCUMENT);
++    final r0dump_ManifestHelper.r0dump_SourceResult totalEventResult =
++        r0dump_parseSource(totalEventParser, 0, 8192, 1);
++    assertThat(totalEventResult.status)
++        .isEqualTo(r0dump_ManifestHelper.r0dump_Status.LIMIT_EXCEEDED);
++    assertThat(totalEventResult.limitHit)
++        .isEqualTo(r0dump_ManifestHelper.r0dump_LimitKind.TOTAL_EVENT_COUNT);
++    verify(totalEventParser).close();
++
++    final XmlResourceParser depthParser = mock(XmlResourceParser.class);
++    when(depthParser.getEventType()).thenReturn(XmlPullParser.START_TAG);
++    when(depthParser.getDepth()).thenReturn(65);
++    final r0dump_ManifestHelper.r0dump_SourceResult depthResult =
++        r0dump_parseSource(depthParser, 0, 8192, 65536);
++    assertThat(depthResult.status).isEqualTo(r0dump_ManifestHelper.r0dump_Status.LIMIT_EXCEEDED);
++    assertThat(depthResult.limitHit).isEqualTo(r0dump_ManifestHelper.r0dump_LimitKind.XML_DEPTH);
++    verify(depthParser).close();
++
++    final XmlResourceParser attributeParser = mock(XmlResourceParser.class);
++    when(attributeParser.getEventType()).thenReturn(XmlPullParser.START_TAG);
++    when(attributeParser.getDepth()).thenReturn(1);
++    when(attributeParser.getName()).thenReturn("manifest");
++    when(attributeParser.getAttributeValue((String) null, "package")).thenReturn("P".repeat(1025));
++    final r0dump_ManifestHelper.r0dump_SourceResult attributeResult =
++        r0dump_parseSource(attributeParser, 0, 8192, 65536);
++    assertThat(attributeResult.status)
++        .isEqualTo(r0dump_ManifestHelper.r0dump_Status.LIMIT_EXCEEDED);
++    assertThat(attributeResult.limitHit)
++        .isEqualTo(r0dump_ManifestHelper.r0dump_LimitKind.ATTRIBUTE_LENGTH);
++    verify(attributeParser).close();
++  }
++
++  @Test
++  public void r0dump_parse_configuredComponentLimit_isEnforced() {
++    final ApplicationInfo appInfo = r0dump_applicationInfo(false);
++
++    final r0dump_ManifestHelper.r0dump_Snapshot componentLimit =
++        r0dump_parse(mLoadedApk, appInfo, PACKAGE_NAME, false, 1);
++    assertThat(componentLimit.status).isEqualTo(r0dump_ManifestHelper.r0dump_Status.LIMIT_EXCEEDED);
++    assertThat(componentLimit.limitHit)
++        .isEqualTo(r0dump_ManifestHelper.r0dump_LimitKind.COMPONENT_COUNT);
++  }
++
++  @Test
++  public void r0dump_parse_resultIsImmutable() {
++    final r0dump_ManifestHelper.r0dump_Snapshot snapshot =
++        r0dump_parse(mLoadedApk, r0dump_applicationInfo(false), PACKAGE_NAME, false, 8192);
++
++    assertThrows(UnsupportedOperationException.class, () -> snapshot.seeds.clear());
++    assertThrows(UnsupportedOperationException.class, () -> snapshot.sources.clear());
++  }
++
++  @Test
++  public void r0dump_normalizeClassName_acceptsManifestFormsAndInnerClass() {
++    assertThat(r0dump_normalizeClassName(PACKAGE_NAME, ".Relative"))
++        .isEqualTo(PACKAGE_NAME + ".Relative");
++    assertThat(r0dump_normalizeClassName(PACKAGE_NAME, "Short")).isEqualTo(PACKAGE_NAME + ".Short");
++    assertThat(r0dump_normalizeClassName(PACKAGE_NAME, "a.b.Full")).isEqualTo("a.b.Full");
++    assertThat(r0dump_normalizeClassName(PACKAGE_NAME, ".Outer$Inner"))
++        .isEqualTo(PACKAGE_NAME + ".Outer$Inner");
++  }
++
++  @Test
++  public void r0dump_normalizeClassName_rejectsUnsafeAndMalformedNames() {
++    assertThat(r0dump_normalizeClassName(PACKAGE_NAME, "Lfoo.Bar;")).isNull();
++    assertThat(r0dump_normalizeClassName(PACKAGE_NAME, "foo/Bar")).isNull();
++    assertThat(r0dump_normalizeClassName(PACKAGE_NAME, "[Lfoo.Bar;")).isNull();
++    assertThat(r0dump_normalizeClassName(PACKAGE_NAME, "foo..Bar")).isNull();
++    assertThat(r0dump_normalizeClassName(PACKAGE_NAME, "foo.1Bar")).isNull();
++    assertThat(r0dump_normalizeClassName(PACKAGE_NAME, "foo\0Bar")).isNull();
++    assertThat(r0dump_normalizeClassName(PACKAGE_NAME, "A".repeat(1025))).isNull();
++  }
++
++  private ApplicationInfo r0dump_applicationInfo(boolean includeSplit) {
++    final ApplicationInfo appInfo = new ApplicationInfo();
++    appInfo.packageName = PACKAGE_NAME;
++    appInfo.sourceDir = mBasePath;
++    appInfo.splitSourceDirs = includeSplit ? new String[] {mSplitPath} : null;
++    return appInfo;
++  }
++
++  private static r0dump_ManifestHelper.r0dump_Snapshot r0dump_parse(
++      LoadedApk loadedApk,
++      ApplicationInfo appInfo,
++      String expectedPackage,
++      boolean includeSplits,
++      int maxComponents) {
++    return r0dump_ManifestHelper.r0dump_parse(
++        loadedApk, appInfo, expectedPackage, includeSplits, r0dump_limits(maxComponents));
++  }
++
++  private static r0dump_ManifestHelper.r0dump_SourceResult r0dump_parseSource(
++      XmlResourceParser parser, int sourceOrdinal, int remainingComponents, int remainingEvents) {
++    return r0dump_ManifestHelper.r0dump_parseSource(
++        parser,
++        sourceOrdinal,
++        r0dump_limits(remainingComponents),
++        remainingComponents,
++        remainingEvents);
++  }
++
++  private static String r0dump_normalizeClassName(String packageName, String rawClassName) {
++    return r0dump_ManifestHelper.r0dump_normalizeClassName(packageName, rawClassName, 1024);
++  }
++
++  private static r0dump_ManifestHelper.r0dump_Limits r0dump_limits(int maxComponents) {
++    return new r0dump_ManifestHelper.r0dump_Limits(maxComponents, 32, 16384, 65536, 64, 1024);
++  }
++
++  private String r0dump_extractApk(int id) throws Exception {
++    final String entryName = mContext.getResources().getResourceEntryName(id);
++    final File path = new File(mContext.getFilesDir(), entryName + ".apk");
++    try (InputStream input = mContext.getResources().openRawResource(id)) {
++      FileUtils.copyToFileOrThrow(input, path);
++    }
++    return path.getAbsolutePath();
++  }
++
++  private static List<String> r0dump_seedNames(r0dump_ManifestHelper.r0dump_Snapshot snapshot) {
++    final ArrayList<String> names = new ArrayList<>();
++    for (r0dump_ManifestHelper.r0dump_ClassSeed seed : snapshot.seeds) {
++      names.add(seed.className);
++    }
++    return names;
++  }
++}
+diff --git a/services/core/java/com/android/server/am/ActivityManagerService.java b/services/core/java/com/android/server/am/ActivityManagerService.java
+index 143294982afa26a950fa2781145a79c80f60ef7c..92057cefcb14560f3ec783bf90b96d4600c3bc4b 100644
+--- a/services/core/java/com/android/server/am/ActivityManagerService.java
++++ b/services/core/java/com/android/server/am/ActivityManagerService.java
+@@ -264,6 +264,7 @@ import android.app.PendingIntent;
+ import android.app.PendingIntentStats;
+ import android.app.ProcessMemoryState;
+ import android.app.ProfilerInfo;
++import android.app.r0dump_FusionConfig;
+ import android.app.ServiceStartNotAllowedException;
+ import android.app.WaitResult;
+ import android.app.assist.ActivityId;
+@@ -1621,6 +1622,12 @@ public class ActivityManagerService extends IActivityManager.Stub
+     @GuardedBy("mProcLock")
+     private ParcelFileDescriptor[] mLifeMonitorFds;
+ 
++    private final r0dump_FilePreparationBridge mR0dumpFilePreparationBridge =
++            new r0dump_FilePreparationBridge();
++    private static final String R0DUMP_MANAGER_PACKAGE = "com.android.r0dumpmanager";
++    private static final String R0DUMP_EXPORT_PERMISSION =
++            "android.permission.MANAGE_R0DUMP_EXPORT";
++
+     static final HostingRecord sNullHostingRecord =
+             new HostingRecord(HostingRecord.HOSTING_TYPE_EMPTY);
+     /**
+@@ -19326,6 +19333,86 @@ public class ActivityManagerService extends IActivityManager.Stub
+         }
+     }
+ 
++    @Override
++    public ParcelFileDescriptor r0dump_prepareOutput(
++            String packageName, String processName, String runId, long generation) {
++        final int callingUid = Binder.getCallingUid();
++        final int callingPid = Binder.getCallingPid();
++        if (packageName == null || processName == null || runId == null
++                || UserHandle.getUserId(callingUid) != UserHandle.USER_SYSTEM) {
++            return null;
++        }
++
++        synchronized (this) {
++            synchronized (mPidsSelfLocked) {
++                final ProcessRecord process = mPidsSelfLocked.get(callingPid);
++                if (process == null
++                        || process.uid != callingUid
++                        || !processName.equals(process.processName)
++                        || !process.getPkgList().containsKey(packageName)) {
++                    return null;
++                }
++            }
++        }
++        if (mPackageManagerInt.getPackageUid(packageName, 0, UserHandle.USER_SYSTEM)
++                != callingUid) {
++            return null;
++        }
++        if (!r0dump_FusionConfig.r0dump_validateOutputPreparationForSystemServer(
++                generation, callingUid, packageName, processName, runId)) {
++            return null;
++        }
++        try {
++            return mR0dumpFilePreparationBridge.prepare(
++                    callingUid, callingPid, packageName, processName, runId, generation);
++        } catch (IOException e) {
++            Slog.w(TAG, "Unable to prepare r0dump output", e);
++            return null;
++        }
++    }
++
++    @Override
++    public ParcelFileDescriptor r0dump_exportLatest(String packageName) {
++        mContext.enforceCallingPermission(R0DUMP_EXPORT_PERMISSION,
++                "r0dump artifact export requires the Manager permission");
++        final int callingUid = Binder.getCallingUid();
++        final int callingPid = Binder.getCallingPid();
++        if (packageName == null
++                || UserHandle.getUserId(callingUid) != UserHandle.USER_SYSTEM
++                || mPackageManagerInt.getPackageUid(R0DUMP_MANAGER_PACKAGE, 0,
++                        UserHandle.USER_SYSTEM) != callingUid
++                || !mAtmInternal.isUidForeground(callingUid)) {
++            throw new SecurityException("r0dump artifact export requires the foreground owner Manager");
++        }
++        synchronized (this) {
++            synchronized (mPidsSelfLocked) {
++                final ProcessRecord process = mPidsSelfLocked.get(callingPid);
++                if (process == null
++                        || process.uid != callingUid
++                        || !process.getPkgList().containsKey(R0DUMP_MANAGER_PACKAGE)) {
++                    throw new SecurityException("r0dump artifact export caller identity mismatch");
++                }
++            }
++        }
++        final ApplicationInfo target = mPackageManagerInt.getApplicationInfo(
++                packageName, 0, Process.SYSTEM_UID, UserHandle.USER_SYSTEM);
++        if (target == null || target.sourceDir == null) {
++            return null;
++        }
++        final int splitCount = target.splitSourceDirs == null ? 0 : target.splitSourceDirs.length;
++        final String[] apkPaths = new String[splitCount + 1];
++        apkPaths[0] = target.sourceDir;
++        if (splitCount != 0) {
++            System.arraycopy(target.splitSourceDirs, 0, apkPaths, 1, splitCount);
++        }
++        try {
++            return mR0dumpFilePreparationBridge.exportLatest(callingUid, packageName, apkPaths);
++        } catch (IOException e) {
++            Slog.w(TAG, "Unable to request r0dump artifact export", e);
++            return null;
++        }
++    }
++
+     @Override
+     public ParcelFileDescriptor getLifeMonitor() {
+         if (!isCallerShell()) {
+diff --git a/services/core/java/com/android/server/am/ProcessErrorStateRecord.java b/services/core/java/com/android/server/am/ProcessErrorStateRecord.java
+index 14a1b0e42b4f0b8977a4472ffc76eba35934e422..b5fc861b9bf8a117cde8ca3bd6816e027046e542 100644
+--- a/services/core/java/com/android/server/am/ProcessErrorStateRecord.java
++++ b/services/core/java/com/android/server/am/ProcessErrorStateRecord.java
+@@ -29,6 +29,7 @@ import android.app.ActivityManager;
+ import android.app.AnrController;
+ import android.app.ApplicationErrorReport;
+ import android.app.ApplicationExitInfo;
++import android.app.r0dump_FusionConfig;
+ import android.content.ComponentName;
+ import android.content.ContentResolver;
+ import android.content.Context;
+@@ -268,6 +269,22 @@ class ProcessErrorStateRecord {
+         mDialogController = new ErrorDialogController(app);
+     }
+ 
++    @GuardedBy("mService")
++    @VisibleForTesting
++    boolean r0dump_shouldSuppressAnrKillLocked(String annotation) {
++        if (mApp.info == null) {
++            return false;
++        }
++        final String packageName = mApp.info.packageName;
++        if (!r0dump_FusionConfig.r0dump_shouldProtectAnr(
++                mApp.uid, packageName, mApp.processName)) {
++            return false;
++        }
++        Slog.w(TAG, "r0dump ANR protection suppressed kill for package=" + packageName
++                + " process=" + mApp.processName + " annotation=" + annotation);
++        return true;
++    }
++
+     @GuardedBy("mService")
+     boolean skipAnrLocked(String annotation) {
+         // PowerManager.reboot() can block for a long time, so ignore ANRs while shutting down.
+@@ -314,6 +331,9 @@ class ProcessErrorStateRecord {
+                 latencyTracker.waitingOnAMSLockEnded();
+                 // Store annotation here as instance below races with this killLocked.
+                 setAnrAnnotation(annotation);
++                if (r0dump_shouldSuppressAnrKillLocked(annotation)) {
++                    return;
++                }
+                 if (android.app.Flags.includeAnrSubreason()) {
+                     mApp.killLocked("anr", ApplicationExitInfo.REASON_ANR,
+                             timeoutRecord.getAppExitInfoAnrSubreason(), true);
+@@ -654,6 +674,9 @@ class ProcessErrorStateRecord {
+         if (mApp.getWindowProcessController().appNotResponding(info.toString(),
+                 () -> {
+                     synchronized (mService) {
++                        if (r0dump_shouldSuppressAnrKillLocked(annotation)) {
++                            return;
++                        }
+                         if (android.app.Flags.includeAnrSubreason()) {
+                             mApp.killLocked("anr", ApplicationExitInfo.REASON_ANR,
+                                     timeoutRecord.getAppExitInfoAnrSubreason(), true);
+@@ -678,6 +701,9 @@ class ProcessErrorStateRecord {
+             }
+ 
+             if (isSilentAnr() && !mApp.isDebugging()) {
++                if (r0dump_shouldSuppressAnrKillLocked(annotation)) {
++                    return;
++                }
+                 if (android.app.Flags.includeAnrSubreason()) {
+                     mApp.killLocked("bg anr", ApplicationExitInfo.REASON_ANR,
+                             timeoutRecord.getAppExitInfoAnrSubreason(), true);
+diff --git a/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java b/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..cc9cbbe587908ca2f3c7ac3f157076e75f002473
+--- /dev/null
++++ b/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
+@@ -0,0 +1,212 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ */
++
++package com.android.server.am;
++
++import static android.system.OsConstants.SOCK_SEQPACKET;
++
++import android.net.LocalSocket;
++import android.net.LocalSocketAddress;
++import android.os.ParcelFileDescriptor;
++import android.system.ErrnoException;
++import android.system.Os;
++import java.io.File;
++import java.io.FileDescriptor;
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.ByteBuffer;
++import java.nio.ByteOrder;
++import java.nio.charset.StandardCharsets;
++
++/** Fixed-protocol client for the init-owned r0dump file helper. */
++final class r0dump_FilePreparationBridge {
++  private static final int MAGIC = 0x52304648;
++  private static final short VERSION = 1;
++  private static final int PACKAGE_BYTES = 96;
++  private static final int PROCESS_BYTES = 96;
++  private static final int RUN_ID_BYTES = 65;
++  private static final int REQUEST_BYTES = 285;
++  private static final int RESPONSE_BYTES = 12;
++  private static final int STATUS_OK = 0;
++  private static final int TIMEOUT_MS = 2000;
++  private static final int EXPORT_MAGIC = 0x52304558;
++  private static final short EXPORT_VERSION = 1;
++  private static final int EXPORT_REQUEST_BYTES = 116;
++  private static final int EXPORT_TIMEOUT_MS = 5 * 60 * 1000;
++  private static final int MAX_APK_COUNT = 32;
++
++  ParcelFileDescriptor prepare(
++      int targetUid,
++      int targetPid,
++      String packageName,
++      String processName,
++      String runId,
++      long generation)
++      throws IOException {
++    final byte[] request =
++        encodeRequest(targetUid, targetPid, packageName, processName, runId, generation);
++    try (LocalSocket socket = new LocalSocket(LocalSocket.SOCKET_SEQPACKET)) {
++      socket.connect(
++          new LocalSocketAddress("r0dump_file_helper", LocalSocketAddress.Namespace.RESERVED));
++      // LocalSocket creates its native fd lazily. Socket options are only valid after connect().
++      socket.setSoTimeout(TIMEOUT_MS);
++      socket.getOutputStream().write(request);
++      socket.getOutputStream().flush();
++
++      final byte[] response = new byte[RESPONSE_BYTES];
++      readExactly(socket.getInputStream(), response);
++      final FileDescriptor[] received = socket.getAncillaryFileDescriptors();
++      try {
++        final ByteBuffer buffer = ByteBuffer.wrap(response).order(ByteOrder.LITTLE_ENDIAN);
++        if (buffer.getInt() != MAGIC
++            || buffer.getShort() != VERSION
++            || Short.toUnsignedInt(buffer.getShort()) != RESPONSE_BYTES
++            || buffer.getInt() != STATUS_OK
++            || received == null
++            || received.length != 1) {
++          return null;
++        }
++        return createDeliveryChannel(received);
++      } finally {
++        closeDescriptors(received);
++      }
++    }
++  }
++
++  ParcelFileDescriptor exportLatest(int requesterUid, String packageName, String[] apkPaths)
++      throws IOException {
++    if (apkPaths == null || apkPaths.length == 0 || apkPaths.length > MAX_APK_COUNT) {
++      throw new IOException("invalid APK path count");
++    }
++    final byte[] request = encodeExportRequest(requesterUid, packageName, apkPaths.length);
++    final ParcelFileDescriptor[] apkDescriptors = new ParcelFileDescriptor[apkPaths.length];
++    try {
++      final FileDescriptor[] descriptors = new FileDescriptor[apkPaths.length];
++      for (int i = 0; i < apkPaths.length; i++) {
++        apkDescriptors[i] =
++            ParcelFileDescriptor.open(new File(apkPaths[i]), ParcelFileDescriptor.MODE_READ_ONLY);
++        descriptors[i] = apkDescriptors[i].getFileDescriptor();
++      }
++      try (LocalSocket socket = new LocalSocket(LocalSocket.SOCKET_SEQPACKET)) {
++        socket.connect(
++            new LocalSocketAddress("r0dump_file_helper", LocalSocketAddress.Namespace.RESERVED));
++        socket.setSoTimeout(EXPORT_TIMEOUT_MS);
++        socket.setFileDescriptorsForSend(descriptors);
++        socket.getOutputStream().write(request);
++        socket.getOutputStream().flush();
++        socket.setFileDescriptorsForSend(null);
++        return ParcelFileDescriptor.dup(socket.getFileDescriptor());
++      }
++    } finally {
++      for (ParcelFileDescriptor descriptor : apkDescriptors) {
++        if (descriptor != null) {
++          descriptor.close();
++        }
++      }
++    }
++  }
++
++  private static ParcelFileDescriptor createDeliveryChannel(FileDescriptor[] directoryDescriptors)
++      throws IOException {
++    final ParcelFileDescriptor[] channel =
++        ParcelFileDescriptor.createSocketPair(SOCK_SEQPACKET);
++    try (ParcelFileDescriptor sender = channel[0]) {
++      final LocalSocket socket = new LocalSocket(sender.getFileDescriptor());
++      socket.setFileDescriptorsForSend(directoryDescriptors);
++      socket.getOutputStream().write(1);
++      socket.getOutputStream().flush();
++      final ParcelFileDescriptor receiver = channel[1];
++      channel[1] = null;
++      return receiver;
++    } finally {
++      if (channel[1] != null) {
++        channel[1].close();
++      }
++    }
++  }
++
++  static byte[] encodeRequest(
++      int targetUid,
++      int targetPid,
++      String packageName,
++      String processName,
++      String runId,
++      long generation)
++      throws IOException {
++    if (targetUid <= 0 || targetPid <= 0 || generation < 0 || (generation & 1L) != 0L) {
++      throw new IOException("invalid request identity");
++    }
++    final ByteBuffer buffer = ByteBuffer.allocate(REQUEST_BYTES).order(ByteOrder.LITTLE_ENDIAN);
++    buffer.putInt(MAGIC);
++    buffer.putShort(VERSION);
++    buffer.putShort((short) REQUEST_BYTES);
++    buffer.putLong(generation);
++    buffer.putInt(0); // Owner user only.
++    buffer.putInt(targetUid);
++    buffer.putInt(targetPid);
++    putFixedString(buffer, packageName, PACKAGE_BYTES);
++    putFixedString(buffer, processName, PROCESS_BYTES);
++    putFixedString(buffer, runId, RUN_ID_BYTES);
++    return buffer.array();
++  }
++
++  static byte[] encodeExportRequest(int requesterUid, String packageName, int apkCount)
++      throws IOException {
++    if (requesterUid <= 0 || apkCount <= 0 || apkCount > MAX_APK_COUNT) {
++      throw new IOException("invalid export identity");
++    }
++    final ByteBuffer buffer =
++        ByteBuffer.allocate(EXPORT_REQUEST_BYTES).order(ByteOrder.LITTLE_ENDIAN);
++    buffer.putInt(EXPORT_MAGIC);
++    buffer.putShort(EXPORT_VERSION);
++    buffer.putShort((short) EXPORT_REQUEST_BYTES);
++    buffer.putInt(0); // Owner user only.
++    buffer.putInt(requesterUid);
++    buffer.putInt(apkCount);
++    putFixedString(buffer, packageName, PACKAGE_BYTES);
++    return buffer.array();
++  }
++
++  private static void putFixedString(ByteBuffer buffer, String value, int capacity)
++      throws IOException {
++    if (value == null) {
++      throw new IOException("missing request field");
++    }
++    final byte[] encoded = value.getBytes(StandardCharsets.UTF_8);
++    if (encoded.length == 0 || encoded.length >= capacity) {
++      throw new IOException("request field too long");
++    }
++    buffer.put(encoded);
++    buffer.position(buffer.position() + capacity - encoded.length);
++  }
++
++  private static void readExactly(InputStream input, byte[] destination) throws IOException {
++    int offset = 0;
++    while (offset < destination.length) {
++      final int read = input.read(destination, offset, destination.length - offset);
++      if (read < 0) {
++        throw new IOException("short helper response");
++      }
++      offset += read;
++    }
++  }
++
++  private static void closeDescriptors(FileDescriptor[] descriptors) {
++    if (descriptors == null) {
++      return;
++    }
++    for (FileDescriptor descriptor : descriptors) {
++      try {
++        Os.close(descriptor);
++      } catch (ErrnoException ignored) {
++      }
++    }
++  }
++}
+diff --git a/services/core/java/com/android/server/am/r0dump_anr_protection_source_test.py b/services/core/java/com/android/server/am/r0dump_anr_protection_source_test.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b563405014dd7284198f443a9da59f9ae17ffde7
+--- /dev/null
++++ b/services/core/java/com/android/server/am/r0dump_anr_protection_source_test.py
+@@ -0,0 +1,40 @@
++#!/usr/bin/env python3
++
++from pathlib import Path
++
++
++ROOT = Path(__file__).resolve().parents[7]
++PROCESS_ERROR = ROOT / "services/core/java/com/android/server/am/ProcessErrorStateRecord.java"
++CONFIG = ROOT / "core/java/android/app/r0dump_FusionConfig.java"
++
++
++def r0dump_require(source: str, needle: str) -> None:
++    if needle not in source:
++        raise AssertionError(f"missing source contract: {needle}")
++
++
++def main() -> None:
++    process_error = PROCESS_ERROR.read_text(encoding="utf-8")
++    config = CONFIG.read_text(encoding="utf-8")
++
++    r0dump_require(process_error, "import android.app.r0dump_FusionConfig;")
++    r0dump_require(
++        process_error,
++        "r0dump_FusionConfig.r0dump_shouldProtectAnr(\n                mApp.uid, packageName, mApp.processName)",
++    )
++    if process_error.count("r0dump_shouldSuppressAnrKillLocked(annotation)") != 3:
++        raise AssertionError("all three ANR kill exits must use the r0dump protection gate")
++    if "persist.sys.r0dump.fusion" in process_error or "SystemProperties" in process_error:
++        raise AssertionError("ProcessErrorStateRecord must not read r0dump properties directly")
++
++    r0dump_require(config, '"anr_protection_enabled"')
++    r0dump_require(
++        config,
++        'r0dump_readPropertyBoolean(properties, "anr_protection_enabled", "0")',
++    )
++    r0dump_require(config, "public static boolean r0dump_shouldProtectAnr(\n      int targetUid")
++    r0dump_require(config, "UserHandle.getUserId(uid) == UserHandle.USER_SYSTEM")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/services/tests/servicestests/src/com/android/server/am/ProcessRecordTests.java b/services/tests/servicestests/src/com/android/server/am/ProcessRecordTests.java
+index b28f2e8986ce6349eb176cd96a3fbc68f489cc77..fec4dd309eab7d6bc1f594ae170bbdd6017966f4 100644
+--- a/services/tests/servicestests/src/com/android/server/am/ProcessRecordTests.java
++++ b/services/tests/servicestests/src/com/android/server/am/ProcessRecordTests.java
+@@ -202,6 +202,18 @@ public class ProcessRecordTests {
+         assertTrue(mProcessRecord.isKilled());
+     }
+ 
++    @Test
++    public void r0dump_silentAnrProtection_keepsTargetProcessAlive() {
++        doReturn(true).when(mProcessErrorState).isSilentAnr();
++        doReturn(true).when(mProcessErrorState).r0dump_shouldSuppressAnrKillLocked(any());
++
++        appNotResponding(mProcessErrorState, "Test protected silent ANR");
++
++        assertTrue(mProcessErrorState.isNotResponding());
++        assertFalse(mProcessRecord.isKilledByAm());
++        assertFalse(mProcessRecord.isKilled());
++    }
++
+     private void appNotResponding(ProcessErrorStateRecord processErrorState,
+             String annotation) {
+         TimeoutRecord timeoutRecord = TimeoutRecord.forInputDispatchNoFocusedWindow(annotation);
+diff --git a/services/tests/servicestests/src/com/android/server/am/r0dump_FilePreparationBridgeTest.java b/services/tests/servicestests/src/com/android/server/am/r0dump_FilePreparationBridgeTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..a8de89ffd31d34bf2cbc9c0712c64114baeb0002
+--- /dev/null
++++ b/services/tests/servicestests/src/com/android/server/am/r0dump_FilePreparationBridgeTest.java
+@@ -0,0 +1,119 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ */
++
++package com.android.server.am;
++
++import static com.google.common.truth.Truth.assertThat;
++import static org.junit.Assert.assertThrows;
++
++import java.io.IOException;
++import java.nio.ByteBuffer;
++import java.nio.ByteOrder;
++import java.nio.charset.StandardCharsets;
++import org.junit.Test;
++
++public class r0dump_FilePreparationBridgeTest {
++  @Test
++  public void encodeRequest_hasStableLittleEndianLayoutAndZeroPadding() throws Exception {
++    final byte[] request =
++        r0dump_FilePreparationBridge.encodeRequest(
++            10198, 2468, "com.coolapk.market", "com.coolapk.market:push", "run-1", 278L);
++
++    assertThat(request).hasLength(285);
++    final ByteBuffer buffer = ByteBuffer.wrap(request).order(ByteOrder.LITTLE_ENDIAN);
++    assertThat(buffer.getInt()).isEqualTo(0x52304648);
++    assertThat(buffer.getShort()).isEqualTo((short) 1);
++    assertThat(Short.toUnsignedInt(buffer.getShort())).isEqualTo(285);
++    assertThat(buffer.getLong()).isEqualTo(278L);
++    assertThat(buffer.getInt()).isEqualTo(0);
++    assertThat(buffer.getInt()).isEqualTo(10198);
++    assertThat(buffer.getInt()).isEqualTo(2468);
++
++    final byte[] packageBytes = new byte[96];
++    buffer.get(packageBytes);
++    assertThat(new String(packageBytes, 0, "com.coolapk.market".length(), StandardCharsets.UTF_8))
++        .isEqualTo("com.coolapk.market");
++    assertThat(packageBytes["com.coolapk.market".length()]).isEqualTo((byte) 0);
++  }
++
++  @Test
++  public void encodeRequest_rejectsOddGenerationAndOversizedField() {
++    assertThrows(
++        IOException.class,
++        () ->
++            r0dump_FilePreparationBridge.encodeRequest(
++                10198, 2468, "com.coolapk.market", "com.coolapk.market", "run", 3L));
++    assertThrows(
++        IOException.class,
++        () ->
++            r0dump_FilePreparationBridge.encodeRequest(
++                10198, 2468, "a".repeat(96), "process", "run", 4L));
++  }
++
++  @Test
++  public void encodeRequest_acceptsSystemUid() throws Exception {
++    final byte[] request =
++        r0dump_FilePreparationBridge.encodeRequest(
++            1000, 2468, "com.android.settings", "com.android.settings", "run", 4L);
++
++    final ByteBuffer buffer = ByteBuffer.wrap(request).order(ByteOrder.LITTLE_ENDIAN);
++    buffer.position(16);
++    assertThat(buffer.getInt()).isEqualTo(0);
++    assertThat(buffer.getInt()).isEqualTo(1000);
++    assertThat(buffer.getInt()).isEqualTo(2468);
++  }
++
++  @Test
++  public void encodeExportRequest_hasStableLayoutAndApkCount() throws Exception {
++    final byte[] request =
++        r0dump_FilePreparationBridge.encodeExportRequest(10195, "com.example.target", 3);
++
++    assertThat(request).hasLength(116);
++    final ByteBuffer buffer = ByteBuffer.wrap(request).order(ByteOrder.LITTLE_ENDIAN);
++    assertThat(buffer.getInt()).isEqualTo(0x52304558);
++    assertThat(buffer.getShort()).isEqualTo((short) 1);
++    assertThat(Short.toUnsignedInt(buffer.getShort())).isEqualTo(116);
++    assertThat(buffer.getInt()).isEqualTo(0);
++    assertThat(buffer.getInt()).isEqualTo(10195);
++    assertThat(buffer.getInt()).isEqualTo(3);
++    final byte[] packageBytes = new byte[96];
++    buffer.get(packageBytes);
++    assertThat(new String(packageBytes, 0, "com.example.target".length(), StandardCharsets.UTF_8))
++        .isEqualTo("com.example.target");
++  }
++
++  @Test
++  public void encodeExportRequest_acceptsSystemUid() throws Exception {
++    final byte[] request =
++        r0dump_FilePreparationBridge.encodeExportRequest(1000, "com.android.settings", 1);
++
++    final ByteBuffer buffer = ByteBuffer.wrap(request).order(ByteOrder.LITTLE_ENDIAN);
++    buffer.position(8);
++    assertThat(buffer.getInt()).isEqualTo(0);
++    assertThat(buffer.getInt()).isEqualTo(1000);
++    assertThat(buffer.getInt()).isEqualTo(1);
++  }
++
++  @Test
++  public void encodeRequest_rejectsZeroUid() {
++    assertThrows(
++        IOException.class,
++        () ->
++            r0dump_FilePreparationBridge.encodeRequest(
++                0, 2468, "com.android.settings", "com.android.settings", "run", 4L));
++  }
++
++  @Test
++  public void encodeExportRequest_rejectsZeroUid() {
++    assertThrows(
++        IOException.class,
++        () -> r0dump_FilePreparationBridge.encodeExportRequest(0, "com.android.settings", 1));
++  }
++}

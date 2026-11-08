@@ -1,0 +1,15 @@
+diff --git a/config/version.mk b/config/version.mk
+index 7b7e646e050e68be0f81c03a9874ba4763d3bdf3..491ca6cf34b6f069fcb2b1b701e9f5f6f0c39964 100644
+--- a/config/version.mk
++++ b/config/version.mk
+@@ -34,8 +34,8 @@ LINEAGE_VERSION_SUFFIX := $(LINEAGE_BUILD_DATE)-$(LINEAGE_BUILDTYPE)$(LINEAGE_EX
+ # Internal version
+ LINEAGE_VERSION := $(PRODUCT_VERSION_MAJOR).$(PRODUCT_VERSION_MINOR)-$(LINEAGE_VERSION_SUFFIX)
+ 
+-# Display version
+-LINEAGE_DISPLAY_VERSION := $(PRODUCT_VERSION_MAJOR)-$(LINEAGE_VERSION_SUFFIX)
++# Display version (r0dump-fusion brand shown in Settings > About > LineageOS version)
++LINEAGE_DISPLAY_VERSION := r0dump-fusion-16-$(LINEAGE_BUILD_DATE)-$(LINEAGE_BUILD)
+ 
+ # LineageOS version properties
+ PRODUCT_PRODUCT_PROPERTIES += \
